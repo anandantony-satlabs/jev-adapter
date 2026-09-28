@@ -86,6 +86,8 @@ export interface JevDecisionResult {
 	elapsedMs?: number;
 	/** Which attempt succeeded (1-based). >1 means a retry happened — check for slowness. */
 	attempts?: number;
+	/** Batch mode only: state ids the model failed to answer (omitted or empty). */
+	missingStates?: string[];
 	/** Present when a retry rescued the call: the unparseable first attempt. */
 	debug?: { firstFailedRaw: string };
 }
@@ -98,6 +100,7 @@ export interface JevBatchResult {
 	usage?: { inputTokens: number; outputTokens: number };
 	elapsedMs?: number;
 	attempts?: number;
+	missingStates?: string[];
 	debug?: { firstFailedRaw: string };
 }
 
@@ -466,8 +469,15 @@ function assembleAnswers(
 			| undefined;
 		if (a === undefined) continue;
 		if (q.type === "boolean") {
-			// flat form: plain number; nested form: {probability}
-			const p = Number(typeof a === "number" ? a : (a.probability ?? a.p));
+			// flat form: plain number or bool; string/JSON-number also coerced;
+			// nested form: {probability} / {p}
+			const p = Number(
+				typeof a === "number" || typeof a === "boolean"
+					? a
+					: typeof a === "string"
+						? a
+						: (a.probability ?? a.p),
+				);
 			if (!Number.isFinite(p)) continue;
 			const clamped = Math.max(0, Math.min(1, p));
 			answers[id] = { type: "boolean", probability: Number(clamped.toFixed(4)) };
@@ -577,10 +587,18 @@ export async function decideBatch(
 	const { prompt, parse } = runDecide(cfg, buildPromptBatch(entries, questions), signal);
 	const { usage, elapsedMs, attempts, parsed, firstFailedRaw } = await parse();
 	const answers: JevBatchResult["answers"] = {};
+	const missingStates: string[] = [];
 	for (const e of entries) {
 		const perState = parsed[e.id] as Record<string, unknown> | undefined;
-		if (!perState) continue;
+		if (!perState) {
+			missingStates.push(e.id);
+			continue;
+		}
 		answers[e.id] = assembleAnswers(questions, perState);
+		if (!Object.keys(answers[e.id]).length) {
+			delete answers[e.id];
+			missingStates.push(e.id);
+		}
 	}
 	if (!Object.keys(answers).length) {
 		throw new Error("Model output JSON matched none of the state IDs");
@@ -593,6 +611,7 @@ export async function decideBatch(
 		usage,
 		elapsedMs,
 		attempts,
+		...(missingStates.length ? { missingStates } : {}),
 		...(firstFailedRaw ? { debug: { firstFailedRaw } } : {}),
 	};
 }
@@ -628,17 +647,23 @@ function runDecide(
 				attempts += 1; // attempts = number of requests actually made
 				const r = await callOpenAiCompatible(cfg, prompt, signal);
 				raw = r.raw;
-				usage = r.usage;
+				// usage accumulates across attempts so the token accounting stays honest
+				usage = usage
+					? {
+							inputTokens: usage.inputTokens + (r.usage?.inputTokens ?? 0),
+							outputTokens: usage.outputTokens + (r.usage?.outputTokens ?? 0),
+						}
+					: r.usage;
 				parsed = extractJson(raw);
 				if (!parsed && attempts === 1) firstFailedRaw = String(raw).slice(0, 400);
 			}
 			const elapsedMs = Date.now() - t0;
 			if (!parsed) {
 				throw new Error(
-					`Could not parse JSON from model output after ${attempts - 1} attempt(s) (first 200 chars: ${String(raw).slice(0, 200)})`,
+					`Could not parse JSON from model output after ${attempts} attempt(s) (last 200 chars: ${String(raw).slice(-200)})`,
 				);
 			}
-			return { usage, elapsedMs, attempts, parsed };
+			return { usage, elapsedMs, attempts, parsed, firstFailedRaw };
 		},
 	};
 }

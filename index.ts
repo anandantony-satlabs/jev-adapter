@@ -11,6 +11,7 @@
  *   JEV_MAX_TOKENS / JEV_TIMEOUT_MS / JEV_RETRIES
  *   JEV_REASONING_EFFORT     none|minimal|low|medium|high|xhigh|max (default low) —
  *                            the latency control; hidden reasoning dominates wall time
+ *   JEV_RESPONSE_FORMAT      json_object (default; server-guaranteed valid JSON) | none
  */
 
 import { Type } from "@earendil-works/pi-ai";
@@ -131,9 +132,12 @@ const jevDecideTool = defineTool({
 		// Compact model-facing text; full detail lives in `details`.
 		const lines = [`channel: ${result.channel}`, `caveat: ${result.caveat}`];
 		if (states && states.length) {
-			const batch = result as unknown as { answers: Record<string, Record<string, unknown>> };
+			const batch = result as unknown as { answers: Record<string, Record<string, unknown>>; missingStates?: string[] };
 			for (const [sid, qa] of Object.entries(batch.answers)) {
 				lines.push(`state ${sid}:`, ...formatAnswers(qa).slice(1).map((l) => `  ${l}`));
+			}
+			if (batch.missingStates?.length) {
+				lines.push(`WARNING: no answer for state(s): ${batch.missingStates.join(", ")}`);
 			}
 		} else {
 			const single = result as unknown as { answers: Record<string, unknown> };
@@ -194,7 +198,7 @@ export default function (pi: ExtensionAPI) {
 				`model:           ${cfg.model}`,
 				`apiKey:          ${cfg.apiKey ? "***" : "(none)"}`,
 				`maxTokens:       ${cfg.maxTokens}  timeout: ${cfg.timeoutMs}ms  retries: ${cfg.retries}`,
-				`reasoningEffort: ${cfg.reasoningEffort}`,
+				`reasoningEffort: ${cfg.reasoningEffort}  responseFormat: ${cfg.responseFormat}`,
 				`source:          ~/.pi/agent/models.json → ${fromModelsJson?.model ?? "(no match; using env overrides)"}`,
 			].join("\n");
 			if (ctx.hasUI) {
