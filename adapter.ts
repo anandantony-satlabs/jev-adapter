@@ -81,6 +81,9 @@ export interface JevDecisionResult {
 		}
 	>;
 	caveat: string;
+	/** Present when the model dropped one or more asked questions (unparseable
+	 *  or omitted answers). Check this before trusting a partial answer set. */
+	missingQuestions?: string[];
 	usage?: { inputTokens: number; outputTokens: number };
 	/** Wall-clock time of the decision request, ms. */
 	elapsedMs?: number;
@@ -97,6 +100,10 @@ export interface JevBatchResult {
 	channel: string;
 	answers: Record<string, JevDecisionResult["answers"]>;
 	caveat: string;
+	/** Batch mode only: question ids that went unanswered for at least one answered
+	 *  state, mapped to the state ids missing them. A state that answered NOTHING
+	 *  is reported via missingStates instead (not double-counted here). */
+	missingQuestions?: Record<string, string[]>;
 	usage?: { inputTokens: number; outputTokens: number };
 	elapsedMs?: number;
 	attempts?: number;
@@ -549,6 +556,7 @@ export async function decide(
 	if (!Object.keys(answers).length) {
 		throw new Error("Model output JSON matched none of the question IDs");
 	}
+	const missingQuestions = Object.keys(questions).filter((qid) => !(qid in answers));
 	return {
 		channel: `local decision model (${cfg.model})`,
 		answers,
@@ -557,6 +565,7 @@ export async function decide(
 		usage,
 		elapsedMs,
 		attempts,
+		...(missingQuestions.length ? { missingQuestions } : {}),
 		...(firstFailedRaw ? { debug: { firstFailedRaw } } : {}),
 	};
 }
@@ -588,6 +597,8 @@ export async function decideBatch(
 	const { usage, elapsedMs, attempts, parsed, firstFailedRaw } = await parse();
 	const answers: JevBatchResult["answers"] = {};
 	const missingStates: string[] = [];
+	// question id -> state ids that answered the batch but dropped this question
+	const missingQuestions = new Map<string, string[]>();
 	for (const e of entries) {
 		const perState = parsed[e.id] as Record<string, unknown> | undefined;
 		if (!perState) {
@@ -598,6 +609,17 @@ export async function decideBatch(
 		if (!Object.keys(answers[e.id]).length) {
 			delete answers[e.id];
 			missingStates.push(e.id);
+			continue;
+		}
+		// Partial miss: the state answered the batch but silently dropped some
+		// question(s). Surface it — a silently-missing score once deranked a whole
+		// review ranking with no warning anywhere.
+		for (const qid of Object.keys(questions)) {
+			if (!(qid in answers[e.id])) {
+				const sids = missingQuestions.get(qid) ?? [];
+				sids.push(e.id);
+				missingQuestions.set(qid, sids);
+			}
 		}
 	}
 	if (!Object.keys(answers).length) {
@@ -612,6 +634,9 @@ export async function decideBatch(
 		elapsedMs,
 		attempts,
 		...(missingStates.length ? { missingStates } : {}),
+		...(missingQuestions.size
+			? { missingQuestions: Object.fromEntries(missingQuestions) }
+			: {}),
 		...(firstFailedRaw ? { debug: { firstFailedRaw } } : {}),
 	};
 }

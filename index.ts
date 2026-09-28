@@ -49,20 +49,31 @@ const jevDecideTool = defineTool({
 			}),
 		),
 		states: Type.Optional(
-			Type.Array(
-				Type.Object({
-					id: Type.String({ description: "Unique state key (used in the answers) — e.g. a commit hash or ticket id" }),
-					state: Type.Union([Type.String(), Type.Record(Type.String(), Type.Unknown())], {
-						description: "The state to judge (string or JSON object).",
-					}),
-				}),
+			// Union with Type.String(): driving models sometimes emit a nested array
+			// as a JSON-encoded string (a tool-args quirk that grows with payload
+			// size); pi validates before execute(), so a strict array schema turns
+			// that into a hard validation error. Accept the string form and
+			// JSON.parse it in execute() instead.
+			Type.Union(
+				[
+					Type.Array(
+						Type.Object({
+							id: Type.String({ description: "Unique state key (used in the answers) — e.g. a commit hash or ticket id" }),
+							state: Type.Union([Type.String(), Type.Record(Type.String(), Type.Unknown())], {
+								description: "The state to judge (string or JSON object).",
+							}),
+						}),
+					),
+					Type.String(),
+				],
 				{
 					description:
 						"Batch mode: judge MULTIPLE independent states against the SAME questions in ONE call (beats N parallel tool calls; the endpoint serializes on the GPU). Mutually exclusive with `state`. Keep it lean: ≤10 states × ≤6 questions.",
 				},
 			),
 		),
-		questions: Type.Record(
+		questions: Type.Union([
+			Type.Record(
 			Type.String({ description: "questionId — only used to key the answers" }),
 			Type.Object({
 				type: Type.Union([Type.Literal("choice"), Type.Literal("score"), Type.Literal("boolean")], {
@@ -81,7 +92,10 @@ const jevDecideTool = defineTool({
 					}),
 				),
 			}),
-		),
+			),
+			// Same model-quirk tolerance as `states`: accept a JSON-encoded string.
+			Type.String(),
+		]),
 		effort: Type.Optional(
 			Type.Union(
 				[
@@ -102,13 +116,26 @@ const jevDecideTool = defineTool({
 	}),
 
 	async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
-		const { state, states, questions, effort } = params as {
-			state?: unknown;
-			states?: JevStateEntry[];
-			effort?: string;
-			questions?: Record<string, JevQuestion>;
+		// Model-quirk tolerance: driving models sometimes emit nested JSON (the
+		// states array, the questions record) as a JSON-encoded string. pi
+		// validates against the widened schema (string | structure) and hands
+		// both forms through; coerce here so downstream code sees structures.
+		const parseMaybe = (v: unknown): unknown => {
+			if (typeof v !== "string") return v;
+			const s = v.trim();
+			if (!(s.startsWith("{") || s.startsWith("["))) return v;
+			try {
+				return JSON.parse(s);
+			} catch {
+				return v; // not valid JSON — keep as a plain string state
+			}
 		};
-		if (!questions || !Object.keys(questions).length) {
+		const state = parseMaybe(params.state) as unknown;
+		const statesParsed = parseMaybe(params.states) as JevStateEntry[] | string | undefined;
+		const questions = parseMaybe(params.questions) as Record<string, JevQuestion> | string | undefined;
+		const effort = (params as { effort?: string }).effort;
+		const states = Array.isArray(statesParsed) ? statesParsed : undefined;
+		if (!questions || typeof questions !== "object" || Array.isArray(questions) || !Object.keys(questions).length) {
 			throw new Error("questions is required (at least one question)");
 		}
 		if (!state && !(states && states.length)) {
@@ -132,16 +159,29 @@ const jevDecideTool = defineTool({
 		// Compact model-facing text; full detail lives in `details`.
 		const lines = [`channel: ${result.channel}`, `caveat: ${result.caveat}`];
 		if (states && states.length) {
-			const batch = result as unknown as { answers: Record<string, Record<string, unknown>>; missingStates?: string[] };
+			const batch = result as unknown as {
+				answers: Record<string, Record<string, unknown>>;
+				missingStates?: string[];
+				missingQuestions?: Record<string, string[]>;
+			};
 			for (const [sid, qa] of Object.entries(batch.answers)) {
 				lines.push(`state ${sid}:`, ...formatAnswers(qa).slice(1).map((l) => `  ${l}`));
 			}
 			if (batch.missingStates?.length) {
 				lines.push(`WARNING: no answer for state(s): ${batch.missingStates.join(", ")}`);
 			}
+			if (batch.missingQuestions && Object.keys(batch.missingQuestions).length) {
+				const parts = Object.entries(batch.missingQuestions).map(
+					([qid, sids]) => `${qid} (${sids.length}/${states.length} states)`,
+				);
+				lines.push(`WARNING: question(s) silently dropped by some state(s): ${parts.join(", ")} - re-ask or treat results as partial`);
+			}
 		} else {
-			const single = result as unknown as { answers: Record<string, unknown> };
+			const single = result as unknown as { answers: Record<string, unknown>; missingQuestions?: string[] };
 			lines.push(...formatAnswers(single.answers));
+			if (single.missingQuestions?.length) {
+				lines.push(`WARNING: question(s) silently dropped: ${single.missingQuestions.join(", ")} - re-ask or treat results as partial`);
+			}
 		}
 		const meta: string[] = [];
 		if (result.elapsedMs !== undefined) meta.push(`elapsed=${(result.elapsedMs / 1000).toFixed(1)}s`);
