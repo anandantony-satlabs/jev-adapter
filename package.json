@@ -1,0 +1,20 @@
+{
+	"name": "pi-jev-adapter",
+	"version": "0.1.0",
+	"description": "pi extension port of dsh-jev-adapter: register a jev_decide tool that runs the Jev (System One) decision-model paradigm over the local OpenAI-compatible endpoint declared in ~/.pi/agent/models.json.",
+	"keywords": ["pi", "pi-coding-agent", "extension", "jev", "system-one", "decision-model", "adapter"],
+	"license": "MIT",
+	"type": "module",
+	"main": "index.ts",
+	"engines": {
+		"node": ">=20.3"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/anandantony-satlabs/jev-adapter.git"
+	}
+}
