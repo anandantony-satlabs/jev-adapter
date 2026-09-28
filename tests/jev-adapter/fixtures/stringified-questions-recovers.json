@@ -1,0 +1,20 @@
+{
+  "args": {
+    "questions": "{\"review_priority\": {\"criteria\": [\"1: trivial\", \"10: must review immediately\"], \"instructions\": \"Priority for expert review 1-10.\", \"type\": \"score\"}}",
+    "state": "golden Costas DD model, 297 lines, sign-sensitive math"
+  },
+  "expect": {
+    "resultContains": "review_priority",
+    "resultIsError": false
+  },
+  "prompt": "Score one commit.",
+  "script": {
+    "args": {
+      "questions": "{\"review_priority\": {\"criteria\": [\"1: trivial\", \"10: must review immediately\"], \"instructions\": \"Priority for expert review 1-10.\", \"type\": \"score\"}}",
+      "state": "golden Costas DD model, 297 lines, sign-sensitive math"
+    },
+    "text": "done",
+    "tool": "jev_decide"
+  },
+  "tool": "jev_decide"
+}

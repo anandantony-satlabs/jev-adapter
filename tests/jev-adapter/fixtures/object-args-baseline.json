@@ -1,0 +1,36 @@
+{
+  "args": {
+    "questions": {
+      "risk": {
+        "instructions": "Would a silent bug here be high-risk for a signal chain?",
+        "type": "boolean"
+      }
+    },
+    "state": {
+      "diff": "+300 lines Costas DD phase detector, sign-sensitive math",
+      "ticket": "T-1"
+    }
+  },
+  "expect": {
+    "resultContains": "P(true)",
+    "resultIsError": false
+  },
+  "prompt": "Classify this commit.",
+  "script": {
+    "args": {
+      "questions": {
+        "risk": {
+          "instructions": "Would a silent bug here be high-risk for a signal chain?",
+          "type": "boolean"
+        }
+      },
+      "state": {
+        "diff": "+300 lines Costas DD phase detector, sign-sensitive math",
+        "ticket": "T-1"
+      }
+    },
+    "text": "done",
+    "tool": "jev_decide"
+  },
+  "tool": "jev_decide"
+}

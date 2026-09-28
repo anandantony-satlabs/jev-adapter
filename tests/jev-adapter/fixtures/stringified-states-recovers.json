@@ -1,0 +1,20 @@
+{
+  "args": {
+    "questions": "{\"risk\": {\"type\": \"boolean\", \"instructions\": \"Would a silent bug here be high-risk for a signal chain?\"}}",
+    "states": "[{\"id\":\"c1\",\"state\":\"300-line fixed-point phase detector with DD rotation math\"},{\"id\":\"c2\",\"state\":\"docs-only commit adding 20 lines of markdown\"}]"
+  },
+  "expect": {
+    "resultContains": "c2",
+    "resultIsError": false
+  },
+  "prompt": "Batch rank two commits.",
+  "script": {
+    "args": {
+      "questions": "{\"risk\": {\"type\": \"boolean\", \"instructions\": \"Would a silent bug here be high-risk for a signal chain?\"}}",
+      "states": "[{\"id\":\"c1\",\"state\":\"300-line fixed-point phase detector with DD rotation math\"},{\"id\":\"c2\",\"state\":\"docs-only commit adding 20 lines of markdown\"}]"
+    },
+    "text": "done",
+    "tool": "jev_decide"
+  },
+  "tool": "jev_decide"
+}
