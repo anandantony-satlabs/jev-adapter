@@ -3,6 +3,8 @@
 pi extension port of [`dsh-jev-adapter`](https://github.com/BetterZflyee/dsh-jev-adapter) (MIT).
 Registers one tool, `jev_decide`, that runs the **Jev (System One) decision-model
 paradigm** over your local OpenAI-compatible endpoint instead of the TypeSafe Jev API.
+Repeatable sandbox fixtures live in `tests/jev-adapter/` (run via extension_sandbox with
+`fixturesDir`).
 
 ## How the endpoint is resolved
 
@@ -11,7 +13,24 @@ paradigm** over your local OpenAI-compatible endpoint instead of the TypeSafe Je
 3. otherwise the tool fails with a clear setup error — **no endpoint is hard-coded**
 
 Optional tuning: `JEV_MAX_TOKENS` (4000), `JEV_TIMEOUT_MS` (120000), `JEV_RETRIES` (3),
-`JEV_MODELS_JSON` (alternate models.json path). Run `/jev-config` to see the resolved values.
+`JEV_MODELS_JSON` (alternate models.json path), `JEV_REASONING_EFFORT` (default `low`),
+`JEV_RESPONSE_FORMAT` (default `json_object`; `none` to disable).
+
+`reasoning_effort` is the latency control: hidden reasoning dominates wall-clock time on
+GLM-5.3 servers (measured: default ~36s / ~1100 completion tokens vs `low` ~1.2s / 41
+tokens for the same question). Accepted values: `none | minimal | low | medium | high |
+xhigh | max`. CAVEAT: `none` does NOT disable thinking — it zeroes the reasoning-token
+accounting but the thinking leaks into `content` as prose (unparseable); use `low` for
+speed, `medium`/`high` for nuanced judgements.
+
+`response_format: json_object` (default) asks the vLLM server for syntactically-valid
+JSON — removes the parse-retry tier at zero latency/behavior cost (probe: honest spreads
+preserved, same token count). Do NOT set `json_schema`: constrained decoding at temp 0
+collapses every answer to one-hot argmax and cannot express sum-to-1.
+
+Each result reports `elapsed`, `attempts` (requests actually made — a value >1 means the
+parse-retry rescued the call), and token `usage` in its `perf:` line. Run `/jev-config`
+to see the resolved values.
 
 ## Usage
 
@@ -20,6 +39,12 @@ Ask the agent to make atomic judgements; it batches them into one `jev_decide` c
 ```
 Classify these 12 support tickets: department + urgency + customer frustration.
 ```
+
+**Batch mode (multiple states):** pass `states: [{id, state}, ...]` to judge many
+independent states (commits, tickets, diffs) against the SAME questions in one call —
+answers come back keyed by state id. One batched call beats N parallel tool calls (the
+local endpoint serializes on the GPU, so parallel calls just queue). Output decode still
+scales with states×questions, so keep it lean: ≤10 states × ≤6 questions per call.
 
 | Question type | You provide | You get back |
 |---|---|---|

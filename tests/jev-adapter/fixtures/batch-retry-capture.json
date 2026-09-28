@@ -1,0 +1,49 @@
+{
+  "prompt": "Classify these three commit diffs using ONE batched jev_decide call.",
+  "script": {
+    "args": {
+      "effort": "low",
+      "questions": {
+        "importance": {
+          "criteria": [
+            "must-review",
+            "skim",
+            "skip"
+          ],
+          "instructions": "Review relevance of this commit",
+          "type": "choice"
+        },
+        "is_rtl": {
+          "instructions": "Does this commit contain RTL or golden-model semantics changes (not docs)?",
+          "type": "boolean"
+        }
+      },
+      "states": [
+        {
+          "id": "e214afe",
+          "state": {
+            "commit": "R3-M2 RTL LANDING: carrier_rec Costas DD forms +102/-9, new vector TB +159, 4/4 vectors, mutation gates 4/4 RED, regress GREEN, shim re-gate PASS"
+          }
+        },
+        {
+          "id": "6941f13",
+          "state": {
+            "commit": "T6 review items closed: 5th gate MUT-E + stray-VCD housekeeping; .gitignore 1 line"
+          }
+        },
+        {
+          "id": "d285be2",
+          "state": {
+            "commit": "USER SIGN-OFF recorded: all T8 pins SIGNED and final; review addendum + handoff doc updates only"
+          }
+        }
+      ]
+    },
+    "text": "DONE-retry-capture",
+    "tool": "jev_decide"
+  },
+  "expect": {
+    "outputContains": "DONE-retry-capture",
+    "resultContains": "state e214afe:"
+  }
+}
