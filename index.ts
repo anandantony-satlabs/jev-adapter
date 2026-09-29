@@ -2,15 +2,22 @@
  * jev-adapter — pi extension port of dsh-jev-adapter (MIT, BetterZflyee).
  *
  * Registers one model tool, `jev_decide`, that runs the Jev (System One)
- * decision-model paradigm over the local OpenAI-compatible endpoint
- * declared in ~/.pi/agent/models.json (local-inference-lab/GLM-5.3-Flash*).
+ * decision-model paradigm over a local OpenAI-compatible endpoint.
+ *
+ * WHICH model decides is data, not code: it comes from
+ * jev-adapter.config.json (`decisionModels`, matched against the model ids in
+ * ~/.pi/agent/models.json). Pointing the tool at a different model is an edit
+ * to that JSON file — nothing in this file names a model.
  *
  * Env overrides (all optional):
+ *   JEV_CONFIG                               alternate jev-adapter.config.json
  *   JEV_BASE_URL / JEV_MODEL / JEV_API_KEY   point elsewhere
  *   JEV_MODELS_JSON                          alternate models.json path
  *   JEV_MAX_TOKENS / JEV_TIMEOUT_MS / JEV_RETRIES
- *   JEV_REASONING_EFFORT     none|minimal|low|medium|high|xhigh|max (default low) —
- *                            the latency control; hidden reasoning dominates wall time
+ *   JEV_REASONING_EFFORT     default effort (a per-call `effort` beats it; the
+ *                            config entry's supportedEfforts/effortMap decide what
+ *                            is actually sendable — unsupported values are clamped,
+ *                            never sent, and the clamp is reported back)
  *   JEV_RESPONSE_FORMAT      json_object (default; server-guaranteed valid JSON) | none
  */
 
@@ -19,11 +26,32 @@ import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	decide,
 	decideBatch,
-	loadEndpointFromModelsJson,
+	describeJevConfig,
 	resolveConfig,
 	type JevQuestion,
 	type JevStateEntry,
 } from "./adapter.js";
+
+/**
+ * Effort vocabulary + how to choose it on the *currently configured* decision
+ * model, rendered into the tool description so the driving model sees real,
+ * config-owned numbers instead of a stale hard-coded guess. Deliberately short
+ * (this text is in every prompt); the long measured note stays in /jev-config.
+ * Best-effort: if the config cannot be resolved the extension still loads.
+ */
+function effortHint(): string {
+	try {
+		const r = resolveConfig();
+		const cand = describeJevConfig().candidates.find((c) => c.match === r.matchedBy);
+		const supported = cand?.supportedEfforts?.length ? cand.supportedEfforts.join(" | ") : "endpoint-dependent";
+		const guide =
+			cand?.effortGuide ??
+			"No measured effort guide for this endpoint in jev-adapter.config.json — run /jev-config to see what it accepts.";
+		return `Effort: choose from ${supported} (anything else is clamped per jev-adapter.config.json and reported as effortClampedFrom). Default here: "${r.effortApplied || "(server default)"}". ${guide}`;
+	} catch {
+		return "Effort vocabulary and latency are endpoint-specific — run /jev-config to see what the configured decision model accepts and how fast each level is.";
+	}
+}
 
 const jevDecideTool = defineTool({
 	name: "jev_decide",
@@ -108,8 +136,7 @@ const jevDecideTool = defineTool({
 					Type.Literal("max"),
 				],
 				{
-					description:
-						"reasoning_effort for this call. Default 'low' (fast: hidden reasoning is the latency bottleneck — baseline ~36s vs ~1.2s at low). Use 'medium'/'high' for genuinely nuanced judgements. CAVEAT: 'none' does NOT disable thinking on GLM-5.3 servers — thinking leaks into content as prose; prefer 'low' for speed.",
+					description: `reasoning_effort for this call. ${effortHint()}`,
 				},
 			),
 		),
@@ -184,6 +211,13 @@ const jevDecideTool = defineTool({
 			}
 		}
 		const meta: string[] = [];
+		if (result.model) meta.push(`model=${result.model}`);
+		if (result.reasoningEffort !== undefined) meta.push(`effort=${result.reasoningEffort || "(server default)"}`);
+		if (result.effortClampedFrom) {
+			lines.push(
+				`WARNING: reasoning_effort "${result.effortClampedFrom}" is not sendable to this endpoint → sent "${result.reasoningEffort || "(nothing; server default)"}". Add the mapping to jev-adapter.config.json if that is not what you meant.`,
+			);
+		}
 		if (result.elapsedMs !== undefined) meta.push(`elapsed=${(result.elapsedMs / 1000).toFixed(1)}s`);
 		if (result.attempts !== undefined && result.attempts > 1) meta.push(`attempts=${result.attempts} (retried)`);
 		if (result.usage) meta.push(`tokens in/out=${result.usage.inputTokens}/${result.usage.outputTokens}`);
@@ -221,28 +255,65 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool(jevDecideTool);
 
 	pi.registerCommand("jev-config", {
-		description: "Show the resolved jev_decide decision-model endpoint",
-		handler: async (_args, ctx) => {
-			const fromModelsJson = loadEndpointFromModelsJson();
-			let cfg: ReturnType<typeof resolveConfig>;
-			try {
-				cfg = resolveConfig();
-			} catch (e) {
-				const msg = `jev-adapter not configured: ${(e as Error).message}`;
-				if (ctx.hasUI) ctx.ui.notify(msg, "warning");
-				else console.error(msg);
-				return;
+		description: "Show the resolved jev_decide decision model (add \"check\" for a live round trip)",
+		handler: async (args, ctx) => {
+			const report = describeJevConfig();
+			const cfg = report.resolved;
+			const lines: string[] = [];
+			if (cfg) {
+				lines.push(
+					`baseURL:         ${cfg.baseURL}`,
+					`model:           ${cfg.model}${cfg.matchedBy ? `  (selected by "${cfg.matchedBy}")` : ""}`,
+					`apiKey:          ${cfg.apiKey ? "***" : "(none)"}`,
+					`maxTokens:       ${cfg.maxTokens}  timeout: ${cfg.timeoutMs}ms  retries: ${cfg.retries}`,
+					`reasoningEffort: ${cfg.effortApplied || "(server default)"}${cfg.effortRequested ? `  (requested "${cfg.effortRequested}" → clamped)` : ""}  responseFormat: ${cfg.responseFormat}`,
+					`config:          ${cfg.configPath ?? "(built-in defaults — no jev-adapter.config.json found)"}`,
+				);
+			} else {
+				lines.push(
+					`jev-adapter not configured: ${report.error ?? "unknown error"}`,
+					`searched for config: ${report.searchOrder.join(", ")}`,
+				);
 			}
-			const text = [
-				`baseURL:         ${cfg.baseURL}`,
-				`model:           ${cfg.model}`,
-				`apiKey:          ${cfg.apiKey ? "***" : "(none)"}`,
-				`maxTokens:       ${cfg.maxTokens}  timeout: ${cfg.timeoutMs}ms  retries: ${cfg.retries}`,
-				`reasoningEffort: ${cfg.reasoningEffort}  responseFormat: ${cfg.responseFormat}`,
-				`source:          ~/.pi/agent/models.json → ${fromModelsJson?.model ?? "(no match; using env overrides)"}`,
-			].join("\n");
+			lines.push(`models.json serves: ${report.served.length ? report.served.join(", ") : "(nothing readable)"}`);
+			lines.push(
+				`configured candidates (first match wins): ${
+					report.candidates.length
+						? report.candidates
+								.map(
+									(c) =>
+										`${c.selected ? "[x]" : "[ ]"} ${c.match}${c.supportedEfforts?.length ? ` (effort ${c.supportedEfforts.join("|")})` : ""}`,
+								)
+								.join(", ")
+						: "(none — set JEV_MODEL or edit jev-adapter.config.json)"
+				}`,
+			);
+			if (cfg?.profileNote) lines.push(`note: ${cfg.profileNote}`);
+			if (report.problems.length) lines.push(`CONFIG PROBLEMS: ${report.problems.join(" | ")}`);
+
+			// "/jev-config check" — one cheap decision, so switching models in JSON is
+			// verifiable without waiting for the agent to happen to call the tool.
+			if (String(args ?? "").trim().toLowerCase() === "check") {
+				if (!cfg) {
+					lines.push("check: skipped (not configured)");
+				} else {
+					try {
+						const t0 = Date.now();
+						const ping = await decide(
+							{ reasoningEffort: "none", maxTokens: 64 },
+							{ probe: "connectivity check" },
+							{ alive: { type: "boolean", instructions: "Is the decision endpoint answering normally?" } },
+						);
+						const p = (ping.answers as { alive?: { probability?: number } }).alive?.probability;
+						lines.push(`check: OK — ${cfg.model} answered in ${((Date.now() - t0) / 1000).toFixed(1)}s (P(alive)=${p})`);
+					} catch (e) {
+						lines.push(`check: FAILED — ${(e as Error).message}`);
+					}
+				}
+			}
+			const text = lines.join("\n");
 			if (ctx.hasUI) {
-				ctx.ui.notify(text, "info");
+				ctx.ui.notify(text, report.error || report.problems.length ? "warning" : "info");
 			} else {
 				console.log(text);
 			}

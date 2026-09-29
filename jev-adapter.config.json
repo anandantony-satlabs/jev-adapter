@@ -1,0 +1,45 @@
+{
+  "configVersion": 1,
+  "$comment": [
+    "Decision-model registry for jev-adapter. Switching the decision model is a JSON edit,",
+    "NOT a code edit: change a `match` string or reorder `decisionModels` — the first entry",
+    "whose `match` appears in a model id in ~/.pi/agent/models.json wins (exact id match",
+    "beats substring within one entry).",
+    "",
+    "This file holds model ids and tuning ONLY — never URLs, hostnames or API keys. Those come",
+    "from ~/.pi/agent/models.json (or JEV_BASE_URL / JEV_MODEL / JEV_API_KEY env overrides).",
+    "",
+    "Search order: $JEV_CONFIG > <extension dir>/jev-adapter.config.json > ~/.pi/agent/jev-adapter.json.",
+    "The first existing file wins (no deep merge) — copy this file to the user-level path if you",
+    "want a personal override that survives upstream updates. Run /jev-config to see what",
+    "resolved, from which file, and why; /jev-config check does a live round trip.",
+    "",
+    "Field resolution per request: call opts > JEV_* env > matched decisionModels entry >",
+    "`defaults` > built-in defaults. `supportedEfforts` + `effortMap` are a SAFETY CONTRACT:",
+    "a reasoning_effort the server would reject is clamped (never sent as-is → no HTTP 400)."
+  ],
+  "defaults": {
+    "reasoningEffort": "low",
+    "maxTokens": 4000,
+    "timeoutMs": 180000,
+    "retries": 3,
+    "responseFormat": "json_object"
+  },
+  "decisionModels": [
+    {
+      "match": "Qwen3.8-Flash-Next-NVFP4",
+      "reasoningEffort": "low",
+      "supportedEfforts": ["none", "low", "medium", "xhigh"],
+      "effortMap": { "minimal": "low", "high": "xhigh", "max": "xhigh" },
+      "effortGuide": "Measured here: \"none\" ~1s / 0 reasoning tokens and is the ONLY latency switch, but it sharpens the distribution (weakens the uncertainty signal) - use it for cheap high-volume classification. \"low\"|\"medium\"|\"xhigh\" all cost ~8-15s with honest spreads, so effort does not buy speed here. Use a thinking level whenever the caller routes on the confidence number.",
+      "note": "vLLM, reasoning model. Measured (temp 0, response_format=json_object, single state / 2 questions): none ~0.8-1.1s / 0 reasoning tokens / clean JSON; low ~8-10s; medium ~10-12s; xhigh ~9-13s; server default (field omitted) ~8-12s. 'minimal', 'high' and 'max' are REJECTED (HTTP 400: 'Supported types are xhigh (default), medium, and low') — effortMap above keeps pi's thinking levels sendable. Latency: effort buys nothing except 'none' (~10x faster). Calibration: on a deliberately ambiguous state 'none' sharpens the spread (top-candidate confidence 0.70 vs 0.29 with thinking; P(need_human) 0.15-0.25 vs 0.63-0.72), so 'none' suits cheap high-volume classification and 'low'/'medium' when the caller routes on the confidence number. Answers always land in `content` (no reasoning_content field). Batch decode ~55 tok/s: 10 states x 3 questions = 18s at none / 37s at medium, 10/10 states answered."
+    },
+    {
+      "match": "GLM-5.3-Flash",
+      "reasoningEffort": "low",
+      "supportedEfforts": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+      "effortGuide": "Measured here: \"low\" ~1.2s is the fast switch and the server default is ~36s, so effort IS the latency dial. Avoid \"none\" - thinking leaks into content as unparseable prose.",
+      "note": "Fallback / rollback entry (move it above the Qwen entry to go back). Measured: server default ~36s / ~1100 completion tokens, low ~1.2s / 41 tokens — here effort IS the latency switch, unlike the Qwen entry. CAVEAT: 'none' zeroes the reasoning-token counter but thinking leaks into `content` as unparseable prose, so 'low' is the real fast switch on this server."
+    }
+  ]
+}

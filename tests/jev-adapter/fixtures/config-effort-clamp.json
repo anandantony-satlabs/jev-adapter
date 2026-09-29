@@ -1,0 +1,28 @@
+{
+  "prompt": "Score this commit with jev_decide asking for an unsupported effort level, to prove the config clamps it instead of 400ing.",
+  "script": {
+    "tool": "jev_decide",
+    "args": {
+      "effort": "max",
+      "state": {
+        "commit": ".gitignore 1 line, no functional change"
+      },
+      "questions": {
+        "importance": {
+          "type": "choice",
+          "instructions": "Review importance",
+          "criteria": {
+            "must-read": "semantics change",
+            "skim": "housekeeping",
+            "skip": "noise"
+          }
+        }
+      }
+    },
+    "text": "DONE-effort-clamp"
+  },
+  "expect": {
+    "outputContains": "DONE-effort-clamp",
+    "resultContains": "not sendable"
+  }
+}

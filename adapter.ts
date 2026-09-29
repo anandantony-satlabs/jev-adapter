@@ -14,20 +14,25 @@
  *    collapsing to a fake 1.0 (without this, confidence saturates
  *    and the low-confidence routing signal is lost);
  *  - tolerates thinking models whose answer lands in reasoning_content
- *    (the local GLM 5.3 Flash endpoint is a reasoning model);
+ *    (both local endpoints this runs against are reasoning models);
  *  - normalises probabilities that do not sum to 1;
  *  - retries with backoff on 429 / 5xx.
+ *
+ * NOTHING ABOUT THE MODEL IS HARD-CODED HERE. Which model is the decision
+ * model, and how it is talked to (reasoning_effort vocabulary, token caps),
+ * comes from jev-adapter.config.json next to this file — see `loadAdapterConfig`
+ * for the search order. Switching endpoints is a JSON edit, not a code edit.
  */
 
-import { readFileSync } from "node:fs";
-
-/** Substring used to find the decision model inside ~/.pi/agent/models.json. */
-const TARGET_MODEL_MATCH = "GLM-5.3-Flash";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // SECURITY NOTE: there is deliberately NO hard-coded endpoint fallback.
 // The endpoint always comes from ~/.pi/agent/models.json (or JEV_BASE_URL /
-// JEV_MODEL / JEV_API_KEY env overrides). Do not commit real hostnames,
-// tailnet names, or keys into this file — it is meant for a public repo.
+// JEV_MODEL / JEV_API_KEY env overrides), and the *model choice* from
+// jev-adapter.config.json. Do not commit real hostnames, tailnet names, or
+// keys into this file or that one — both are meant for a public repo.
 
 export interface JevQuestion {
 	type: "choice" | "score" | "boolean";
@@ -51,9 +56,10 @@ export interface JevAdapterConfig {
 	retries?: number;
 	/**
 	 * reasoning_effort for the decision model ('none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max').
-	 * Hidden reasoning dominates wall-clock latency (measured: baseline ~36s/1100 tok vs 'low' ~1.2s/41 tok).
-	 * NOTE: 'none' does NOT disable thinking on GLM-5.3 servers — it zeroes reasoning_tokens
-	 * accounting but the thinking leaks into `content` as prose (unparseable). 'low' is the true fast switch.
+	 * Whether it is sendable at all, and what it buys, is ENDPOINT-SPECIFIC and lives in
+	 * jev-adapter.config.json (`supportedEfforts` / `effortMap` / per-entry default) — the
+	 * measured numbers are in that file's `note` fields. A value the server would reject is
+	 * clamped, never sent as-is, and the clamp is reported back to the caller.
 	 */
 	reasoningEffort?: string;
 	/**
@@ -93,6 +99,14 @@ export interface JevDecisionResult {
 	missingStates?: string[];
 	/** Present when a retry rescued the call: the unparseable first attempt. */
 	debug?: { firstFailedRaw: string };
+	/** Decision model id that answered (config-driven; check it when results look off). */
+	model?: string;
+	/** reasoning_effort actually sent ('' = omitted → server default). */
+	reasoningEffort?: string;
+	/** Set when the requested effort was not sendable and got clamped. */
+	effortClampedFrom?: string;
+	/** Set when the server rejected the requested effort outright (sent without the field). */
+	effortDropped?: string;
 }
 
 /** Multi-state batch result: answers[stateId][questionId]. */
@@ -109,6 +123,237 @@ export interface JevBatchResult {
 	attempts?: number;
 	missingStates?: string[];
 	debug?: { firstFailedRaw: string };
+	model?: string;
+	reasoningEffort?: string;
+	effortClampedFrom?: string;
+	effortDropped?: string;
+}
+
+/* ------------------------------------------------------------------ */
+/* Adapter config: WHICH model decides, and how to talk to it          */
+/*                                                                     */
+/* Everything model-specific lives in jev-adapter.config.json so that  */
+/* pointing the tool at a different decision model is a JSON edit.     */
+/* ------------------------------------------------------------------ */
+
+/** Tunables that can be set per model entry, in `defaults`, or per call. */
+export interface JevTuning {
+	reasoningEffort?: string;
+	maxTokens?: number;
+	timeoutMs?: number;
+	retries?: number;
+	responseFormat?: "json_object" | "none";
+}
+
+/** One `decisionModels` entry: a model selector plus its endpoint quirks. */
+export interface JevModelProfile extends JevTuning {
+	/** Exact model id, or a substring of one, as found in models.json. */
+	match: string;
+	/**
+	 * Efforts this server accepts. A requested effort outside this list is NEVER
+	 * sent as-is (vLLM answers those with HTTP 400 and the whole call is lost).
+	 */
+	supportedEfforts?: string[];
+	/** Requested → sendable, consulted before giving up on a clamped effort. */
+	effortMap?: Record<string, string>;
+	/** Free text: measured behaviour of this endpoint, surfaced by /jev-config. */
+	note?: string;
+	/**
+	 * One or two sentences telling the CALLING model how to pick an effort on this
+	 * endpoint. Kept short on purpose: it is rendered into the jev_decide tool
+	 * description, i.e. it costs prompt tokens in every session. `note` is the
+	 * long-form version, shown only by /jev-config.
+	 */
+	effortGuide?: string;
+}
+
+export interface AdapterConfigFile {
+	/** Where it was read from (null = built-in defaults only). */
+	path: string | null;
+	source: "file" | "builtin";
+	defaults: JevTuning;
+	decisionModels: JevModelProfile[];
+	/** Config problems found while validating — surfaced, never silently ignored. */
+	problems: string[];
+}
+
+/** Built-in last resort; `defaults` in the config file normally overrides these. */
+const BUILTIN_TUNING: Required<JevTuning> = {
+	reasoningEffort: "low",
+	maxTokens: 4000,
+	timeoutMs: 180000,
+	retries: 3,
+	responseFormat: "json_object",
+};
+
+const CONFIG_FILENAME = "jev-adapter.config.json";
+
+/** This module's directory, tolerant of jiti (CJS) and plain node (ESM) hosts. */
+const EXT_DIR = (() => {
+	try {
+		return dirname(fileURLToPath(import.meta.url));
+	} catch {
+		return process.cwd();
+	}
+})();
+
+function expandHome(p: string): string {
+	if (!p.startsWith("~")) return p;
+	const home = process.env.HOME ?? process.env.USER_PROFILE ?? "";
+	return join(home, p.slice(1));
+}
+
+/** Config search order: $JEV_CONFIG, then the repo copy, then the user copy. */
+export function adapterConfigPaths(): { paths: string[]; explicit: boolean } {
+	if (process.env.JEV_CONFIG) return { paths: [expandHome(process.env.JEV_CONFIG)], explicit: true };
+	return {
+		paths: [join(EXT_DIR, CONFIG_FILENAME), expandHome("~/.pi/agent/jev-adapter.json")],
+		explicit: false,
+	};
+}
+
+function statKey(file: string): string {
+	try {
+		const s = statSync(file);
+		return `${file}:${s.mtimeMs}:${s.size}`;
+	} catch {
+		return `${file}:missing`;
+	}
+}
+
+const TUNING_KEYS = ["reasoningEffort", "maxTokens", "timeoutMs", "retries", "responseFormat"] as const;
+
+/** Copy the known tunables out of a JSON object, recording anything malformed. */
+function validateTuning(raw: unknown, where: string, problems: string[]): JevTuning {
+	const out: JevTuning = {};
+	if (raw === undefined || raw === null) return out;
+	if (typeof raw !== "object" || Array.isArray(raw)) {
+		problems.push(`${where}: not an object — ignored`);
+		return out;
+	}
+	const obj = raw as Record<string, unknown>;
+	for (const key of Object.keys(obj)) {
+		if (!TUNING_KEYS.includes(key as (typeof TUNING_KEYS)[number])) {
+			problems.push(`${where}: unknown key "${key}" — ignored (typo?)`);
+			continue;
+		}
+		const v = obj[key];
+		if (key === "responseFormat") {
+			if (v === "json_object" || v === "none") out.responseFormat = v;
+			else problems.push(`${where}.responseFormat: "${String(v)}" is not "json_object" or "none" — ignored`);
+		} else if (key === "reasoningEffort") {
+			if (typeof v === "string" && v) out.reasoningEffort = v;
+			else problems.push(`${where}.reasoningEffort: must be a non-empty string — ignored`);
+		} else {
+			const n = Number(v);
+			if (!Number.isFinite(n) || n <= 0) problems.push(`${where}.${key}: "${String(v)}" is not a positive number — ignored`);
+			else (out as unknown as Record<string, number>)[key] = n;
+		}
+	}
+	return out;
+}
+
+function validateProfiles(raw: unknown, where: string, problems: string[]): JevModelProfile[] {
+	if (raw === undefined || raw === null) return [];
+	if (!Array.isArray(raw)) {
+		problems.push(`${where}: must be an array — ignored`);
+		return [];
+	}
+	const out: JevModelProfile[] = [];
+	raw.forEach((entry, i) => {
+		const at = `${where}[${i}]`;
+		if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+			problems.push(`${at}: not an object — dropped`);
+			return;
+		}
+		const e = entry as Record<string, unknown>;
+		if (typeof e.match !== "string" || !e.match.trim()) {
+			problems.push(`${at}: missing "match" (the model id / substring) — dropped`);
+			return;
+		}
+		const RESERVED = ["match", "supportedEfforts", "effortMap", "note", "effortGuide"];
+		const tunables: Record<string, unknown> = {};
+		for (const [k, v] of Object.entries(e)) if (!RESERVED.includes(k)) tunables[k] = v;
+		const profile: JevModelProfile = { match: e.match.trim(), ...validateTuning(tunables, at, problems) };
+		if (Array.isArray(e.supportedEfforts)) {
+			profile.supportedEfforts = e.supportedEfforts.filter((s): s is string => typeof s === "string" && !!s);
+		}
+		if (e.effortMap && typeof e.effortMap === "object" && !Array.isArray(e.effortMap)) {
+			const m: Record<string, string> = {};
+			for (const [k, v] of Object.entries(e.effortMap as Record<string, unknown>)) {
+				if (typeof v === "string" && v) m[k] = v;
+				else problems.push(`${at}.effortMap.${k}: must be a string — ignored`);
+			}
+			profile.effortMap = m;
+		}
+		if (typeof e.note === "string") profile.note = e.note;
+		if (typeof e.effortGuide === "string") profile.effortGuide = e.effortGuide;
+		if (profile.supportedEfforts?.length && profile.reasoningEffort && !profile.supportedEfforts.includes(profile.reasoningEffort)) {
+			problems.push(`${at}: default reasoningEffort "${profile.reasoningEffort}" is not in supportedEfforts — every call will be clamped`);
+		}
+		out.push(profile);
+	});
+	return out;
+}
+
+const configCache = new Map<string, AdapterConfigFile>();
+
+/**
+ * Read the adapter config. Search order: explicit `path` arg / $JEV_CONFIG,
+ * then <extension dir>/jev-adapter.config.json, then ~/.pi/agent/jev-adapter.json.
+ * The first existing file wins (no merge). An explicit path that cannot be read
+ * is a hard error — silently deciding with the wrong model is worse.
+ */
+export function loadAdapterConfig(path?: string): AdapterConfigFile {
+	const { paths, explicit } = adapterConfigPaths();
+	const wanted = path ? [expandHome(path)] : paths;
+	const key = `${wanted.map(statKey).join("|")}:${explicit ? "x" : "s"}`;
+	const cached = configCache.get(key);
+	if (cached) return cached;
+
+	const problems: string[] = [];
+	let chosen: string | null = null;
+	let parsed: Record<string, unknown> = {};
+	for (const file of wanted) {
+		if (!existsSync(file)) continue;
+		let raw: string;
+		try {
+			raw = readFileSync(file, "utf8");
+		} catch (e) {
+			const msg = `${file}: unreadable (${(e as Error).message})`;
+			if (explicit) throw new Error(`jev-adapter: JEV_CONFIG points at an unreadable file — ${msg}`);
+			problems.push(msg + " — skipped");
+			continue;
+		}
+		try {
+			parsed = JSON.parse(raw) as Record<string, unknown>;
+		} catch (e) {
+			const msg = `${file}: invalid JSON (${(e as Error).message})`;
+			if (explicit) throw new Error(`jev-adapter: JEV_CONFIG is not valid JSON — ${msg}`);
+			problems.push(msg + " — skipped");
+			continue;
+		}
+		chosen = file;
+		break;
+	}
+	if (explicit && !chosen) {
+		throw new Error(
+			`jev-adapter: JEV_CONFIG points at ${wanted[0]}, which does not exist — refusing to decide with the built-in/repo config (the wrong decision model is worse than no decision).`,
+		);
+	}
+
+	const cfg: AdapterConfigFile = {
+		path: chosen,
+		source: chosen ? "file" : "builtin",
+		defaults: validateTuning(parsed.defaults, "defaults", problems),
+		decisionModels: validateProfiles(parsed.decisionModels, "decisionModels", problems),
+		problems,
+	};
+	if (chosen && !cfg.decisionModels.length) {
+		problems.push(`${chosen}: no usable decisionModels entries — the model must come from JEV_MODEL / a models.json lookup by name`);
+	}
+	configCache.set(key, cfg);
+	return cfg;
 }
 
 /* ------------------------------------------------------------------ */
@@ -130,41 +375,80 @@ export interface EndpointInfo {
 	baseURL: string;
 	apiKey: string;
 	model: string;
+	/** provider key in models.json — diagnostics only */
+	provider: string;
 }
 
-/** Locate the decision model in ~/.pi/agent/models.json (or a path override). Returns null when unreadable or unmatched. Cached per key for the process lifetime — models.json is not expected to change mid-session. */
-const endpointCache = new Map<string, EndpointInfo | null>();
-export function loadEndpointFromModelsJson(path?: string): EndpointInfo | null {
-	let file = path ?? process.env.JEV_MODELS_JSON;
-	if (!file) {
-		const home = process.env.HOME ?? process.env.USER_PROFILE ?? "";
-		file = `${home}/.pi/agent/models.json`;
-	}
-	const key = `${file}:${process.env.JEV_BASE_URL ?? ""}:${process.env.JEV_MODEL ?? ""}:${process.env.JEV_API_KEY ? "k" : ""}`;
-	if (endpointCache.has(key)) return endpointCache.get(key) ?? null;
-	let resolved: EndpointInfo | null = null;
+function modelsJsonPath(path?: string): string {
+	if (path) return expandHome(path);
+	if (process.env.JEV_MODELS_JSON) return expandHome(process.env.JEV_MODELS_JSON);
+	const home = process.env.HOME ?? process.env.USER_PROFILE ?? "";
+	return join(home, ".pi", "agent", "models.json");
+}
+
+/** Every usable (baseUrl, model) pair in models.json. [] when unreadable/malformed. */
+export function listModelEndpoints(path?: string): EndpointInfo[] {
+	const file = modelsJsonPath(path);
+	const out: EndpointInfo[] = [];
 	try {
-		const raw = JSON.parse(readFileSync(file)) as ModelsJson;
-		const providers = raw.providers ?? {};
-		for (const provider of Object.values(providers)) {
-			for (const model of provider.models ?? []) {
-				const id = model.id ?? "";
-				if (id.includes(TARGET_MODEL_MATCH) && provider.baseUrl) {
-					resolved = {
-						baseURL: provider.baseUrl.replace(/\/$/, ""),
-						apiKey: provider.apiKey ?? "",
-						model: id,
-					};
-					break;
-				}
+		const raw = JSON.parse(readFileSync(file, "utf8")) as ModelsJson;
+		for (const [provider, p] of Object.entries(raw.providers ?? {})) {
+			if (!p?.baseUrl) continue;
+			for (const model of p.models ?? []) {
+				const id = model?.id ?? "";
+				if (!id) continue;
+				out.push({ baseURL: p.baseUrl.replace(/\/$/, ""), apiKey: p.apiKey ?? "", model: id, provider });
 			}
-			if (resolved) break;
 		}
 	} catch {
-		/* unreadable or malformed models.json — treat as unresolved */
+		/* unreadable or malformed models.json — treated as "nothing available" */
 	}
-	endpointCache.set(key, resolved);
-	return resolved;
+	return out;
+}
+
+/** exact id match beats substring; first profile in config order wins. */
+function findByMatch(endpoints: EndpointInfo[], match: string): EndpointInfo | undefined {
+	return (
+		endpoints.find((e) => e.model === match) ?? endpoints.find((e) => e.model.includes(match))
+	);
+}
+
+/** The profile whose `match` selects `modelId` (exact first, then substring). */
+export function pickProfile(cfg: AdapterConfigFile, modelId: string): JevModelProfile | undefined {
+	if (!modelId) return undefined;
+	return (
+		cfg.decisionModels.find((p) => p.match === modelId) ??
+		cfg.decisionModels.find((p) => modelId.includes(p.match))
+	);
+}
+
+/** Walk `decisionModels` in config order and return the first model actually served. */
+export function pickPreferredEndpoint(
+	endpoints: EndpointInfo[],
+	cfg: AdapterConfigFile = loadAdapterConfig(),
+): EndpointInfo | null {
+	for (const profile of cfg.decisionModels) {
+		const hit = findByMatch(endpoints, profile.match);
+		if (hit) return hit;
+	}
+	return null;
+}
+
+/**
+ * Locate the decision model in ~/.pi/agent/models.json (or a path override),
+ * choosing between the models actually served using the config file's
+ * preference order. Returns null when unreadable or unmatched. Cached per
+ * (models.json mtime, config mtime, env) so config edits are picked up.
+ */
+const endpointCache = new Map<string, EndpointInfo | null>();
+export function loadEndpointFromModelsJson(path?: string, cfg?: AdapterConfigFile): EndpointInfo | null {
+	const file = modelsJsonPath(path);
+	const conf = cfg ?? loadAdapterConfig();
+	const key = `${statKey(file)}|${conf.path ?? "builtin"}|${conf.decisionModels.map((p) => p.match).join(",")}|${process.env.JEV_BASE_URL ?? ""}|${process.env.JEV_MODEL ?? ""}|${process.env.JEV_API_KEY ? "k" : ""}`;
+	if (endpointCache.has(key)) return endpointCache.get(key) ?? null;
+	const resolved = pickPreferredEndpoint(listModelEndpoints(file), conf);
+	endpointCache.set(key, resolved ?? null);
+	return resolved ?? null;
 }
 
 /* ------------------------------------------------------------------ */
@@ -364,39 +648,177 @@ function numEnv(name: string): number | undefined {
 	return Number.isFinite(n) ? n : undefined;
 }
 
-/** Resolve the effective config: explicit opts → env vars → models.json. Throws when no endpoint can be resolved. */
-export function resolveConfig(opts: JevAdapterConfig = {}): Required<JevAdapterConfig> {
-	const fromModelsJson = loadEndpointFromModelsJson();
-	const baseURL = (opts.baseURL ?? process.env.JEV_BASE_URL ?? fromModelsJson?.baseURL ?? "").replace(/\/$/, "");
+/** Remap a requested reasoning_effort to something the target server accepts. */
+export function clampEffort(
+	requested: string,
+	profile: JevModelProfile | undefined,
+): { applied: string; requested?: string; dropped?: boolean } {
+	const supported = profile?.supportedEfforts;
+	if (!requested) return { applied: "" };
+	if (!supported?.length || supported.includes(requested)) return { applied: requested };
+	const mapped = profile?.effortMap?.[requested];
+	if (mapped && supported.includes(mapped)) return { applied: mapped, requested };
+	// No sendable translation: omit the field (server default) rather than burn the
+	// call on a guaranteed HTTP 400 — but tell the caller we did it.
+	return { applied: "", requested, dropped: true };
+}
+
+/** Everything resolveConfig settled on, including the diagnostics /jev-config shows. */
+export type ResolvedJevConfig = Required<JevAdapterConfig> & {
+	/** jev-adapter.config.json actually used (null → built-in defaults only). */
+	configPath: string | null;
+	/** the config entry's `match` that selected this model. */
+	matchedBy?: string;
+	/** measured-behaviour note from that config entry. */
+	profileNote?: string;
+	/** reasoning_effort actually sent ('' → field omitted, server default). */
+	effortApplied: string;
+	/** set when the requested effort was not sendable and had to be remapped. */
+	effortRequested?: string;
+	/** set when the requested effort had no sendable translation (field omitted). */
+	effortDropped?: string;
+	/** config validation problems that mattered to this resolution. */
+	configProblems: string[];
+};
+
+/**
+ * Resolve the effective config.
+ * Layer order per field: call opts → JEV_* env → matched config entry →
+ * config `defaults` → built-in. Throws when no endpoint can be resolved.
+ */
+export function resolveConfig(opts: JevAdapterConfig = {}): ResolvedJevConfig {
+	const cfg = loadAdapterConfig();
+	const served = listModelEndpoints();
+	const requestedModel = opts.model ?? process.env.JEV_MODEL ?? "";
+	const preferred = pickPreferredEndpoint(served, cfg);
+	const model = requestedModel || preferred?.model || "";
+	// The provider (baseUrl + key) must belong to the model actually chosen: when
+	// JEV_MODEL names a model served by a DIFFERENT provider than the preferred
+	// one, borrowing the preferred provider's URL would silently send the state —
+	// and that provider's key — to the wrong endpoint.
+	const endpoint =
+		(model ? findByMatch(served, model) : undefined) ?? (requestedModel ? undefined : preferred);
+	const profile = pickProfile(cfg, model);
+	const baseURL = (opts.baseURL ?? process.env.JEV_BASE_URL ?? endpoint?.baseURL ?? "").replace(/\/$/, "");
 	if (!baseURL) {
+		const wanted = cfg.decisionModels.map((p) => `"${p.match}"`).join(", ") || "(none configured)";
+		const ids = served.map((e) => e.model);
 		throw new Error(
-			`jev-adapter: no decision endpoint. Add a provider with a "${TARGET_MODEL_MATCH}" model to ~/.pi/agent/models.json, or set JEV_BASE_URL + JEV_MODEL (and JEV_API_KEY if the endpoint needs auth).`,
+			`jev-adapter: no decision endpoint. The config looks for ${wanted}, but ~/.pi/agent/models.json `
+				+ `serves ${ids.length ? ids.join(", ") : "nothing readable"}. Add a matching model (with a baseUrl provider) there, `
+				+ `or point jev-adapter.config.json at one, or set JEV_BASE_URL + JEV_MODEL (and JEV_API_KEY if the endpoint needs auth).`,
 		);
 	}
 	// SECURITY: whatever baseURL resolves to, the resolved apiKey is sent to
 	// it as a Bearer header. Only point JEV_BASE_URL at endpoints you trust —
 	// a hostile endpoint receives both the key and the judged state payload.
+	const numTune = (key: "maxTokens" | "timeoutMs" | "retries", env: string): number =>
+		(opts[key] ?? numEnv(env) ?? profile?.[key] ?? cfg.defaults[key] ?? BUILTIN_TUNING[key]) as number;
+	const effortRequested =
+		opts.reasoningEffort ??
+		process.env.JEV_REASONING_EFFORT ??
+		profile?.reasoningEffort ??
+		cfg.defaults.reasoningEffort ??
+		BUILTIN_TUNING.reasoningEffort;
+	const clamped = clampEffort(effortRequested, profile);
 	return {
 		baseURL,
-		apiKey: opts.apiKey ?? process.env.JEV_API_KEY ?? fromModelsJson?.apiKey ?? "",
-		model: opts.model ?? process.env.JEV_MODEL ?? fromModelsJson?.model ?? "",
-		maxTokens: opts.maxTokens ?? numEnv("JEV_MAX_TOKENS") ?? 4000,
-		timeoutMs: opts.timeoutMs ?? numEnv("JEV_TIMEOUT_MS") ?? 120000,
-		retries: opts.retries ?? numEnv("JEV_RETRIES") ?? 3,
-		reasoningEffort: opts.reasoningEffort ?? process.env.JEV_REASONING_EFFORT ?? "low",
+		apiKey: opts.apiKey ?? process.env.JEV_API_KEY ?? endpoint?.apiKey ?? "",
+		model,
+		maxTokens: numTune("maxTokens", "JEV_MAX_TOKENS"),
+		timeoutMs: numTune("timeoutMs", "JEV_TIMEOUT_MS"),
+		retries: numTune("retries", "JEV_RETRIES"),
+		reasoningEffort: clamped.applied,
 		responseFormat:
 			opts.responseFormat ??
-			(process.env.JEV_RESPONSE_FORMAT as "json_object" | "none" | undefined) ??
-			"json_object",
+			(process.env.JEV_RESPONSE_FORMAT as JevTuning["responseFormat"] | undefined) ??
+			profile?.responseFormat ??
+			cfg.defaults.responseFormat ??
+			BUILTIN_TUNING.responseFormat,
+		configPath: cfg.path,
+		matchedBy: profile?.match,
+		profileNote: profile?.note,
+		effortApplied: clamped.applied,
+		...(clamped.requested && clamped.requested !== clamped.applied
+			? { effortRequested: clamped.requested, ...(clamped.dropped ? { effortDropped: clamped.requested } : {}) }
+			: {}),
+		configProblems: cfg.problems,
+	};
+}
+
+/** Fields every result carries about WHICH model answered and at what effort. */
+function effortFields(
+	cfg: ResolvedJevConfig,
+	/** set when the server itself rejected the effort (HTTP 400) and we retried without it */
+	serverRejected?: string,
+): Pick<JevDecisionResult, "model" | "reasoningEffort" | "effortClampedFrom" | "effortDropped"> {
+	const dropped = cfg.effortDropped ?? serverRejected;
+	return {
+		model: cfg.model,
+		// what actually went on the wire, not what we wanted
+		reasoningEffort: serverRejected ? "" : cfg.effortApplied,
+		...(cfg.effortRequested ? { effortClampedFrom: cfg.effortRequested } : {}),
+		...(dropped ? { effortDropped: dropped } : {}),
+	};
+}
+
+/** Everything /jev-config needs to explain the current resolution. */
+export interface JevConfigReport {
+	configPath: string | null;
+	configSource: "file" | "builtin";
+	searchOrder: string[];
+	problems: string[];
+	served: string[];
+	candidates: { match: string; selected: boolean; note?: string; effortGuide?: string; reasoningEffort?: string; supportedEfforts?: string[] }[];
+	resolved: ResolvedJevConfig | null;
+	error?: string;
+}
+
+export function describeJevConfig(): JevConfigReport {
+	const cfg = loadAdapterConfig();
+	const served = listModelEndpoints().map((e) => e.model);
+	let resolved: ResolvedJevConfig | null = null;
+	let error: string | undefined;
+	try {
+		resolved = resolveConfig();
+	} catch (e) {
+		error = (e as Error).message;
+	}
+	return {
+		configPath: cfg.path,
+		configSource: cfg.source,
+		searchOrder: adapterConfigPaths().paths,
+		problems: cfg.problems,
+		served,
+		candidates: cfg.decisionModels.map((p) => ({
+			match: p.match,
+			selected: !!resolved?.matchedBy && resolved.matchedBy === p.match,
+			note: p.note,
+			effortGuide: p.effortGuide,
+			reasoningEffort: p.reasoningEffort,
+			supportedEfforts: p.supportedEfforts,
+		})),
+		resolved,
+		error,
 	};
 }
 
 async function callOpenAiCompatible(
-	cfg: Required<JevAdapterConfig>,
+	cfg: ResolvedJevConfig,
 	prompt: string,
 	signal?: AbortSignal,
-): Promise<{ raw: string; usage?: { inputTokens: number; outputTokens: number }; attempts: number }> {
+): Promise<{
+	raw: string;
+	usage?: { inputTokens: number; outputTokens: number };
+	attempts: number;
+	/** set when the server rejected our reasoning_effort (400) and we retried without it */
+	effortRejected?: string;
+}> {
 	let lastErr = "";
+	// Local, mutable copy: an endpoint whose effort vocabulary we don't know
+	// (no config entry, or a stale supportedEfforts list) answers with HTTP 400.
+	let sendEffort = cfg.reasoningEffort;
+	let effortRejected: string | undefined;
 	for (let attempt = 0; attempt < cfg.retries; attempt += 1) {
 		if (attempt) await sleep(1500 * 2 ** (attempt - 1));
 		if (signal?.aborted) throw new Error("Aborted");
@@ -416,7 +838,7 @@ async function callOpenAiCompatible(
 					],
 					max_tokens: cfg.maxTokens,
 					temperature: 0,
-					...(cfg.reasoningEffort ? { reasoning_effort: cfg.reasoningEffort } : {}),
+					...(sendEffort ? { reasoning_effort: sendEffort } : {}),
 					...(cfg.responseFormat && cfg.responseFormat !== "none"
 						? { response_format: { type: cfg.responseFormat } }
 						: {}),
@@ -435,7 +857,18 @@ async function callOpenAiCompatible(
 			continue;
 		}
 		if (!res.ok) {
-			lastErr = `HTTP ${res.status}: ${(await res.text()).slice(0, 250)}`;
+			const body = (await res.text()).slice(0, 250);
+			// Self-heal for an endpoint we have no config entry for: a 400 about
+			// reasoning effort means its effort vocabulary differs from what we sent.
+			// Drop the field (the 400 cost ~30ms) and keep the decision — but surface
+			// it, because a silent downgrade would hide a real config gap.
+			if (res.status === 400 && sendEffort && /reasoning[_ ]?effort/i.test(body)) {
+				effortRejected = sendEffort;
+				sendEffort = "";
+				lastErr = `HTTP 400: reasoning_effort "${effortRejected}" rejected, retrying without it`;
+				continue;
+			}
+			lastErr = `HTTP ${res.status}: ${body}`;
 			break;
 		}
 		const data = (await res.json()) as {
@@ -454,6 +887,7 @@ async function callOpenAiCompatible(
 					}
 				: undefined,
 			attempts: attempt + 1,
+			...(effortRejected ? { effortRejected } : {}),
 		};
 	}
 	throw new Error(`decision endpoint failed (${cfg.model}): ${lastErr}`);
@@ -493,9 +927,10 @@ function assembleAnswers(
 			if (!cands.length) continue;
 			let probs = cands.map((c) => {
 				// flat form: parsed[id] is {cand: p}; nested form: parsed[id].probabilities
-				const obj = typeof a === "object" ? (a as Record<string, unknown>) : undefined;
+				const obj = typeof a === "object" && a !== null ? (a as Record<string, unknown>) : undefined;
+				const nested = obj?.probabilities as Record<string, unknown> | undefined;
 				const flat = obj?.[c.name];
-				const v = Number(flat !== undefined ? flat : obj?.probabilities?.[c.name]);
+				const v = Number(flat !== undefined ? flat : nested?.[c.name]);
 				return Number.isFinite(v) && v >= 0 ? v : 0;
 			});
 			const sum = probs.reduce((x, y) => x + y, 0);
@@ -548,10 +983,12 @@ export async function decide(
 ): Promise<JevDecisionResult> {
 	const cfg = resolveConfig(opts);
 	if (!cfg.model) {
-		throw new Error("jev-adapter: no decision model configured (set JEV_MODEL or add one to ~/.pi/agent/models.json).");
+		throw new Error(
+			"jev-adapter: no decision model configured — add one to decisionModels in jev-adapter.config.json (and make sure ~/.pi/agent/models.json serves it), or set JEV_MODEL.",
+		);
 	}
 	const { prompt, parse } = runDecide(cfg, buildPrompt(state, questions), signal);
-	const { usage, elapsedMs, attempts, parsed, firstFailedRaw } = await parse();
+	const { usage, elapsedMs, attempts, parsed, firstFailedRaw, effortRejected } = await parse();
 	const answers = assembleAnswers(questions, parsed);
 	if (!Object.keys(answers).length) {
 		throw new Error("Model output JSON matched none of the question IDs");
@@ -565,6 +1002,7 @@ export async function decide(
 		usage,
 		elapsedMs,
 		attempts,
+		...effortFields(cfg, effortRejected),
 		...(missingQuestions.length ? { missingQuestions } : {}),
 		...(firstFailedRaw ? { debug: { firstFailedRaw } } : {}),
 	};
@@ -591,10 +1029,12 @@ export async function decideBatch(
 	}
 	const cfg = resolveConfig(opts);
 	if (!cfg.model) {
-		throw new Error("jev-adapter: no decision model configured (set JEV_MODEL or add one to ~/.pi/agent/models.json).");
+		throw new Error(
+			"jev-adapter: no decision model configured — add one to decisionModels in jev-adapter.config.json (and make sure ~/.pi/agent/models.json serves it), or set JEV_MODEL.",
+		);
 	}
 	const { prompt, parse } = runDecide(cfg, buildPromptBatch(entries, questions), signal);
-	const { usage, elapsedMs, attempts, parsed, firstFailedRaw } = await parse();
+	const { usage, elapsedMs, attempts, parsed, firstFailedRaw, effortRejected } = await parse();
 	const answers: JevBatchResult["answers"] = {};
 	const missingStates: string[] = [];
 	// question id -> state ids that answered the batch but dropped this question
@@ -633,6 +1073,7 @@ export async function decideBatch(
 		usage,
 		elapsedMs,
 		attempts,
+		...effortFields(cfg, effortRejected),
 		...(missingStates.length ? { missingStates } : {}),
 		...(missingQuestions.size
 			? { missingQuestions: Object.fromEntries(missingQuestions) }
@@ -643,7 +1084,7 @@ export async function decideBatch(
 
 /** Build the prompt, then return a parse() closure implementing the retry-on-mangled-JSON loop. */
 function runDecide(
-	cfg: Required<JevAdapterConfig>,
+	cfg: ResolvedJevConfig,
 	prompt: string,
 	signal?: AbortSignal,
 ): {
@@ -655,6 +1096,8 @@ function runDecide(
 		parsed: Record<string, unknown>;
 		/** Present when a retry happened: the unparseable first-attempt raw (for post-mortems). */
 		firstFailedRaw?: string;
+		/** Present when the server rejected our reasoning_effort (400) and we retried without it. */
+		effortRejected?: string;
 	}>;
 } {
 	return {
@@ -668,9 +1111,11 @@ function runDecide(
 			let attempts = 0;
 			let parsed: Record<string, unknown> | null = null;
 			let firstFailedRaw: string | undefined;
+			let effortRejected: string | undefined;
 			while (!parsed && attempts < cfg.retries) {
 				attempts += 1; // attempts = number of requests actually made
 				const r = await callOpenAiCompatible(cfg, prompt, signal);
+				if (r.effortRejected) effortRejected = r.effortRejected;
 				raw = r.raw;
 				// usage accumulates across attempts so the token accounting stays honest
 				usage = usage
@@ -688,7 +1133,7 @@ function runDecide(
 					`Could not parse JSON from model output after ${attempts} attempt(s) (last 200 chars: ${String(raw).slice(-200)})`,
 				);
 			}
-			return { usage, elapsedMs, attempts, parsed, firstFailedRaw };
+			return { usage, elapsedMs, attempts, parsed, firstFailedRaw, ...(effortRejected ? { effortRejected } : {}) };
 		},
 	};
 }

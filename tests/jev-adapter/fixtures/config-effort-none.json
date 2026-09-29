@@ -1,0 +1,28 @@
+{
+  "prompt": "Judge this commit with a single fast jev_decide call at effort none.",
+  "script": {
+    "tool": "jev_decide",
+    "args": {
+      "effort": "none",
+      "state": {
+        "commit": "RTL landing: carrier_rec Costas DD forms +102/-9, new vector TB +159, mutation gates 4/4 RED, regress GREEN"
+      },
+      "questions": {
+        "importance": {
+          "type": "choice",
+          "instructions": "How important is this commit to review?",
+          "criteria": {
+            "must-read": "changes signal semantics",
+            "skim": "docs or housekeeping",
+            "skip": "typo only"
+          }
+        }
+      }
+    },
+    "text": "DONE-effort-none"
+  },
+  "expect": {
+    "outputContains": "DONE-effort-none",
+    "resultContains": "effort=none"
+  }
+}
