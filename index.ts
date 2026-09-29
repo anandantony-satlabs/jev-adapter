@@ -24,10 +24,14 @@
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
+	adapterLocalPath,
 	decide,
 	decideBatch,
 	describeJevConfig,
+	listServedModels,
+	nameMatches,
 	resolveConfig,
+	writeModelPreference,
 	type JevQuestion,
 	type JevStateEntry,
 } from "./adapter.js";
@@ -218,6 +222,11 @@ const jevDecideTool = defineTool({
 				`WARNING: reasoning_effort "${result.effortClampedFrom}" is not sendable to this endpoint → sent "${result.reasoningEffort || "(nothing; server default)"}". Add the mapping to jev-adapter.config.json if that is not what you meant.`,
 			);
 		}
+		if (result.modelFallbackFrom) {
+			lines.push(
+				`WARNING: preferred decision model "${result.modelFallbackFrom}" was unavailable (not declared in ~/.pi/agent/models.json) → ${result.model} answered, which has a DIFFERENT effort vocabulary and latency. Start the other server (declare its model in models.json) or run /jev-use <available>.`,
+			);
+		}
 		if (result.elapsedMs !== undefined) meta.push(`elapsed=${(result.elapsedMs / 1000).toFixed(1)}s`);
 		if (result.attempts !== undefined && result.attempts > 1) meta.push(`attempts=${result.attempts} (retried)`);
 		if (result.usage) meta.push(`tokens in/out=${result.usage.inputTokens}/${result.usage.outputTokens}`);
@@ -276,6 +285,23 @@ export default function (pi: ExtensionAPI) {
 				);
 			}
 			lines.push(`models.json serves: ${report.served.length ? report.served.join(", ") : "(nothing readable)"}`);
+			if (cfg) {
+				// Declared vs actually loaded: one GPU usually runs one decision model,
+				// and models.json only declares what MAY be there.
+				const live = await listServedModels(cfg);
+				lines.push(
+					`endpoint serves now: ${
+						live.ok ? (live.models.length ? live.models.join(", ") : "(nothing loaded)") : `(probe failed: ${live.error})`
+					}${live.ok && live.models.length > 0 && !live.models.includes(cfg.model) ? "   ← DOES NOT INCLUDE THE CONFIGURED MODEL" : ""}`,
+				);
+				lines.push(
+					`preference:      ${
+						cfg.preferred?.length
+							? `${cfg.preferred.join(" > ")} (from ${process.env.JEV_USE_MODEL ? "$JEV_USE_MODEL" : adapterLocalPath()})`
+							: "file order (no override)"
+					} — switch with /jev-use <name>${cfg.preferredNotServed ? `   ← preferred "${cfg.preferredNotServed}" NOT declared in models.json; using the next entry` : ""}`,
+				);
+			}
 			lines.push(
 				`configured candidates (first match wins): ${
 					report.candidates.length
@@ -291,8 +317,10 @@ export default function (pi: ExtensionAPI) {
 			if (cfg?.profileNote) lines.push(`note: ${cfg.profileNote}`);
 			if (report.problems.length) lines.push(`CONFIG PROBLEMS: ${report.problems.join(" | ")}`);
 
-			// "/jev-config check" — one cheap decision, so switching models in JSON is
-			// verifiable without waiting for the agent to happen to call the tool.
+			// "/jev-config check" — one real decision at the CONFIG DEFAULT effort, so
+			// what gets verified is the path the tool will actually take (forcing
+			// effort=none would verify a special case and falsely fail on endpoints
+			// where 'none' leaks prose into content).
 			if (String(args ?? "").trim().toLowerCase() === "check") {
 				if (!cfg) {
 					lines.push("check: skipped (not configured)");
@@ -300,12 +328,14 @@ export default function (pi: ExtensionAPI) {
 					try {
 						const t0 = Date.now();
 						const ping = await decide(
-							{ reasoningEffort: "none", maxTokens: 64 },
+							{ maxTokens: 128 },
 							{ probe: "connectivity check" },
 							{ alive: { type: "boolean", instructions: "Is the decision endpoint answering normally?" } },
 						);
 						const p = (ping.answers as { alive?: { probability?: number } }).alive?.probability;
-						lines.push(`check: OK — ${cfg.model} answered in ${((Date.now() - t0) / 1000).toFixed(1)}s (P(alive)=${p})`);
+						lines.push(
+							`check: OK — ${cfg.model} answered in ${((Date.now() - t0) / 1000).toFixed(1)}s at effort "${ping.reasoningEffort || "(server default)"}" (P(alive)=${p})`,
+						);
 					} catch (e) {
 						lines.push(`check: FAILED — ${(e as Error).message}`);
 					}
@@ -317,6 +347,84 @@ export default function (pi: ExtensionAPI) {
 			} else {
 				console.log(text);
 			}
+		},
+	});
+
+	// Endpoint ping-pong (GLM-5.3-Flash ↔ Qwen3.8-Next, or anything else declared in
+	// the config): one command, no editor. The effort vocabulary/guide switches with
+	// the model because both are per-entry in jev-adapter.config.json. The choice is
+	// written to a local, un-versioned file, so the tracked config file stays clean.
+	pi.registerCommand("jev-use", {
+		description: "Switch the decision model: /jev-use <name|substring> [check] — with no argument, list candidates and probe the endpoint live",
+		handler: async (args, ctx) => {
+			const parts = String(args ?? "").trim().split(/\s+/).filter(Boolean);
+			const want = parts.find((p) => p.toLowerCase() !== "check") ?? "";
+			const alsoCheck = parts.some((p) => p.toLowerCase() === "check");
+			const lines: string[] = [];
+			const emit = (warn: boolean) => {
+				if (ctx.hasUI) ctx.ui.notify(lines.join("\n"), warn ? "warning" : "info");
+				else console.log(lines.join("\n"));
+			};
+
+			if (want) {
+				const before = describeJevConfig();
+				const hit = before.candidates.find((c) => nameMatches(c.match, want));
+				if (!hit) {
+					lines.push(
+						`"${want}" matches no decisionModels entry. Configured: ${before.candidates.map((c) => c.match).join(", ") || "(none)"}.`,
+						`Add it to ${before.configPath ?? "jev-adapter.config.json"} first (match + supportedEfforts + effortGuide) — then /jev-use will work.`,
+					);
+					emit(true);
+					return;
+				}
+				lines.push(`preference saved → ${hit.match} (${writeModelPreference(hit.match)})`);
+			}
+
+			const report = describeJevConfig();
+			const cfg = report.resolved;
+			if (!cfg) {
+				lines.push(`not configured: ${report.error ?? "unknown error"}`);
+				emit(true);
+				return;
+			}
+			const cand = report.candidates.find((c) => c.match === cfg.matchedBy);
+			if (cfg.preferredNotServed) {
+				lines.push(
+					`NOTICE: preferred "${cfg.preferredNotServed}" is not declared in ~/.pi/agent/models.json, so "${cfg.matchedBy}" answers instead — DIFFERENT effort vocabulary and latency. Start the other server (and declare its model in models.json), or /jev-use <available>.`,
+				);
+			}
+			lines.push(
+				`using:    ${cfg.model}`,
+				`effort:   default "${cfg.effortApplied || "(server default)"}", sendable ${cand?.supportedEfforts?.join("|") ?? "(endpoint-dependent)"}`,
+				`          ${cand?.effortGuide ?? ""}`,
+			);
+			const live = await listServedModels(cfg);
+			if (!live.ok) {
+				lines.push(`live probe: FAILED (${live.error}) — endpoint unreachable?`);
+			} else if (!live.models.includes(cfg.model)) {
+				lines.push(
+					`live probe: the endpoint serves ${live.models.length ? live.models.join(", ") : "(nothing)"} — NOT ${cfg.model}. Preference is saved, but decisions will fail until that server is up (or /jev-use <other>).`,
+				);
+			} else {
+				lines.push(`live probe: OK — endpoint serves ${cfg.model}`);
+			}
+			if (alsoCheck) {
+				try {
+					const t0 = Date.now();
+					const ping = await decide({ maxTokens: 128 }, { probe: "switch verification" }, {
+						alive: { type: "boolean", instructions: "Is the decision endpoint answering normally?" },
+					});
+					lines.push(
+						`check: OK — answered in ${((Date.now() - t0) / 1000).toFixed(1)}s at effort "${ping.reasoningEffort || "(server default)"}" (P(alive)=${(ping.answers as { alive?: { probability?: number } }).alive?.probability})`,
+					);
+				} catch (e) {
+					lines.push(`check: FAILED — ${(e as Error).message}`);
+				}
+			} else {
+				lines.push('tip: add "check" to also run one live decision at this model\'s default effort');
+			}
+			if (report.problems.length) lines.push(`CONFIG PROBLEMS: ${report.problems.join(" | ")}`);
+			emit(report.problems.length > 0);
 		},
 	});
 }

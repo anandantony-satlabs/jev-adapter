@@ -44,6 +44,31 @@ fetch-mocked unit tests that need no endpoint.
   effort that is not in its own `supportedEfforts` all show up as `CONFIG PROBLEMS` in
   `/jev-config` (and the entry is still used).
 
+## Switching between two decision models
+
+Switching is expected to happen back and forth (e.g. `GLM-5.3-Flash` ↔
+`Qwen3.8-Flash-Next-NVFP4`, one GPU running one vLLM process), so it is a command, not an
+edit:
+
+```
+/jev-use                 # list candidates + what the endpoint actually serves right now
+/jev-use glm             # prefer the GLM entry (writes ~/.pi/agent/jev-adapter.local.json)
+/jev-use qwen check      # switch back and run one live decision at that model's default effort
+JEV_USE_MODEL=glm pi …   # same, for one process/session, without writing anything
+```
+
+* The preference only ever **reorders** `decisionModels` (`{ "prefer": ["…"] }` in the local
+  file) — `jev-adapter.config.json` is never rewritten, so per-endpoint tuning and the effort
+  vocabulary travel with the model. That matters because those two endpoints behave
+  **oppositely**: on Qwen only `none` is fast (and it sharpens distributions), on GLM `low`
+  is the fast switch and `none` leaks prose into `content`.
+* `$JEV_USE_MODEL` beats the local file; unknown preference names are reported as `CONFIG
+  PROBLEMS` and leave the order intact.
+* `models.json` declares what *may* be served; `/jev-config` also probes `GET {baseURL}/models`
+  to show what the endpoint serves *now*, and flags `← DOES NOT INCLUDE THE CONFIGURED MODEL`.
+  If you switch while the other server is down, `jev_decide` fails with exactly that
+  explanation (listing what is served and how to switch back) instead of an opaque 404.
+
 ## Endpoint resolution
 
 1. `JEV_BASE_URL` / `JEV_MODEL` / `JEV_API_KEY` env vars, if set
@@ -99,12 +124,14 @@ a retry rescued the call) and token `usage` in its `perf:` line.
 ## Inspecting / verifying the setup
 
 ```
-/jev-config          # resolved baseURL/model/effort/tuning, config file used, candidates, typos
-/jev-config check    # the same, plus one live decision round trip
+/jev-config          # resolved baseURL/model/effort/tuning, config file used, candidates, typos,
+                     # what models.json declares AND what the endpoint serves right now
+/jev-config check    # the same, plus one live decision at the configured default effort
+/jev-use             # current preference + candidates + live probe; /jev-use <name> switches
 ```
 
 ```
-node tests/jev-adapter/unit-config-resolution.mjs   # config/preference/clamp logic, mocked fetch
+node tests/jev-adapter/unit-config-resolution.mjs   # config/preference/switch/clamp logic, mocked fetch
 node tests/jev-adapter/unit-missing-questions.mjs   # partial-answer accounting, mocked fetch
 ```
 
@@ -144,9 +171,11 @@ signal — see the table above).
   compromised primary agent could craft input that coaxes high confidence out of the
   decision model. Probabilities are **self-reported estimates, not calibrated** — every
   result carries this caveat. Keep a human in the loop for high-risk actions.
-- The extension performs network calls to the configured decision endpoint only.
-  No `eval`, no child processes, no filesystem writes; the only files read are
-  `jev-adapter.config.json` and `models.json` (contents are never echoed).
+- The extension performs network calls to the configured decision endpoint only. No `eval`,
+  no child processes. It reads `jev-adapter.config.json`, the local preference file, and
+  `models.json` (contents never echoed), and **writes exactly one file**: the local
+  preference file (`~/.pi/agent/jev-adapter.local.json`, path overridable with `$JEV_LOCAL`)
+  and only when you run `/jev-use`. No secrets end up in any of them.
 
 ## Credits
 

@@ -2,11 +2,12 @@
 // Exercises jev-adapter.config.json end to end with a mocked fetch and throwaway
 // models.json / config files — no endpoint, no network. Covers: preference order,
 // provider isolation, effort clamping, the 400 self-heal, and config validation.
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const dir = mkdtempSync(join(tmpdir(), "jev-cfg-test-"));
+const readFileSyncLocal = (p) => readFileSync(p, "utf8");
 const write = (name, obj) => {
 	const p = join(dir, name);
 	writeFileSync(p, JSON.stringify(obj, null, 2));
@@ -60,7 +61,7 @@ const modelsJson = write("models.json", {
 });
 process.env.JEV_MODELS_JSON = modelsJson;
 
-const { resolveConfig, decide, loadAdapterConfig, clampEffort, describeJevConfig } = await import("../../adapter.ts");
+const { resolveConfig, decide, loadAdapterConfig, clampEffort, describeJevConfig, writeModelPreference, adapterLocalPath, nameMatches } = await import("../../adapter.ts");
 
 let failures = 0;
 const check = (name, cond, extra = "") => {
@@ -186,6 +187,53 @@ try {
 	hardErr = e.message;
 }
 check("JEV_CONFIG missing file is a hard error", /unreadable|JEV_CONFIG/.test(hardErr), hardErr);
+
+// --- 8. switching between two endpoints (GLM <-> Qwen) without editing JSON ---
+const localFile = join(dir, "jev-adapter.local.json");
+process.env.JEV_LOCAL = localFile;
+writeFileSync(localFile, JSON.stringify({ prefer: ["glm"] }));
+process.env.JEV_CONFIG = preferQwen; // the tracked file still prefers Qwen
+r = resolveConfig();
+check("prefer file switches the model without editing the config", r.model.includes("GLM"), r.model);
+check("prefer is reported back", (r.preferred || []).some((p) => p.includes("GLM")), JSON.stringify(r.preferred));
+
+process.env.JEV_USE_MODEL = "qwen";
+r = resolveConfig();
+check("$JEV_USE_MODEL overrides the local preference file", r.model.includes("Qwen"), r.model);
+delete process.env.JEV_USE_MODEL;
+
+writeFileSync(localFile, JSON.stringify({ prefer: ["llama-9b"] }));
+r = resolveConfig();
+check("unknown preference is reported, not silently honoured", r.configProblems.some((p) => /llama-9b/.test(p)), JSON.stringify(r.configProblems));
+check("unknown preference leaves the file order intact", r.model.includes("Qwen"), r.model);
+
+const written = writeModelPreference("GLM-5.3-Flash");
+check("writeModelPreference writes the local file", written === adapterLocalPath() && JSON.parse(readFileSyncLocal(written)).prefer[0] === "GLM-5.3-Flash", written);
+r = resolveConfig();
+check("switch via /jev-use path takes effect immediately", r.model.includes("GLM"), r.model);
+check("nameMatches accepts loose names", nameMatches("glm", "GLM-5.3-Flash") && nameMatches("Qwen3.8", "local-inference-lab/Qwen3.8-Flash-Next-NVFP4") && !nameMatches("glm", "Qwen3.8-Flash-Next-NVFP4"));
+
+// the preferred endpoint is not declared in models.json: fall back, but LOUDLY —
+// the two endpoints have opposite effort semantics, a silent swap would mislead
+const threeWay = cfgFor("three-way.json", {
+	decisionModels: [
+		{ match: "Qwen3.8-Flash-Next-NVFP4", reasoningEffort: "low" },
+		{ match: "GLM-5.3-Flash", reasoningEffort: "low" },
+		{ match: "Llama-9B-Decision", reasoningEffort: "low" },
+	],
+});
+process.env.JEV_CONFIG = threeWay;
+writeFileSync(localFile, JSON.stringify({ prefer: ["llama"] }));
+r = resolveConfig();
+check("unavailable preference falls back to the next declared entry", r.model.includes("Qwen"), r.model);
+check("…and reports it (preferredNotServed)", r.preferredNotServed === "Llama-9B-Decision", JSON.stringify({ p: r.preferred, f: r.preferredNotServed }));
+out = await decide({}, { commit: "x" }, Q);
+check("decision result carries modelFallbackFrom", out.modelFallbackFrom === "Llama-9B-Decision", JSON.stringify({ m: out.model, f: out.modelFallbackFrom }));
+writeFileSync(localFile, JSON.stringify({ prefer: ["qwen"] }));
+r = resolveConfig();
+check("no false alarm when the preference IS the served model", r.preferredNotServed === undefined && r.model.includes("Qwen"), JSON.stringify({ m: r.model, f: r.preferredNotServed }));
+
+delete process.env.JEV_LOCAL;
 
 rmSync(dir, { recursive: true, force: true });
 console.log(failures ? `\n${failures} FAILURE(S)` : "\nall config checks passed");

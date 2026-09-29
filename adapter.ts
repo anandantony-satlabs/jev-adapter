@@ -24,7 +24,7 @@
  * for the search order. Switching endpoints is a JSON edit, not a code edit.
  */
 
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -105,6 +105,8 @@ export interface JevDecisionResult {
 	reasoningEffort?: string;
 	/** Set when the requested effort was not sendable and got clamped. */
 	effortClampedFrom?: string;
+	/** Set when the preferred decision model was unavailable and a later one answered. */
+	modelFallbackFrom?: string;
 	/** Set when the server rejected the requested effort outright (sent without the field). */
 	effortDropped?: string;
 }
@@ -127,6 +129,7 @@ export interface JevBatchResult {
 	reasoningEffort?: string;
 	effortClampedFrom?: string;
 	effortDropped?: string;
+	modelFallbackFrom?: string;
 }
 
 /* ------------------------------------------------------------------ */
@@ -173,8 +176,95 @@ export interface AdapterConfigFile {
 	source: "file" | "builtin";
 	defaults: JevTuning;
 	decisionModels: JevModelProfile[];
+	/**
+	 * Active preference (from $JEV_USE_MODEL and the local override file), in the
+	 * order applied to `decisionModels`. Empty = plain file order. This is what
+	 * makes switching between two endpoints a one-command thing.
+	 */
+	preferred: string[];
+	/** Local preference file, when one exists. */
+	localPath: string | null;
 	/** Config problems found while validating — surfaced, never silently ignored. */
 	problems: string[];
+}
+
+/**
+ * Local (un-versioned) preference override — written by `/jev-use`, so switching
+ * endpoints does not dirty the tracked config file. Shape: `{ "prefer": ["GLM"] }`.
+ * `$JEV_LOCAL` overrides the path; `$JEV_USE_MODEL` is the same thing for one
+ * process/session without touching any file (it wins over the file).
+ */
+export function adapterLocalPath(): string {
+	return expandHome(process.env.JEV_LOCAL ?? "~/.pi/agent/" + LOCAL_FILENAME);
+}
+
+function loadPreferenceOverride(): { prefer: string[]; path: string | null; problems: string[] } {
+	const file = adapterLocalPath();
+	const problems: string[] = [];
+	if (!existsSync(file)) return { prefer: [], path: null, problems };
+	try {
+		const raw = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+		const prefer = Array.isArray(raw.prefer) ? raw.prefer.filter((p): p is string => typeof p === "string" && !!p) : [];
+		if (!Array.isArray(raw.prefer) && raw.prefer !== undefined) problems.push(`${file}: "prefer" must be an array of strings — ignored`);
+		for (const key of Object.keys(raw)) {
+			if (key !== "prefer" && !key.startsWith("$")) problems.push(`${file}: unknown key "${key}" — ignored (only "prefer" is honoured here)`);
+		}
+		return { prefer, path: file, problems };
+	} catch (e) {
+		problems.push(`${file}: invalid JSON (${(e as Error).message}) — preference override ignored`);
+		return { prefer: [], path: file, problems };
+	}
+}
+/** Move the preferred entries to the front of `decisionModels` (stable otherwise). */
+function applyPreference(cfg: AdapterConfigFile, prefer: string[]): void {
+	if (!prefer.length || cfg.decisionModels.length < 2) return;
+	const chosen: JevModelProfile[] = [];
+	for (const q of prefer) {
+		const hits = cfg.decisionModels.filter((m) => !chosen.includes(m) && looseMatch(m.match, q));
+		if (!hits.length) {
+			cfg.problems.push(`preference "${q}" matches no decisionModels entry (have: ${cfg.decisionModels.map((m) => m.match).join(", ")}) — ignored`);
+			continue;
+		}
+		chosen.push(...hits);
+	}
+	cfg.decisionModels = [...chosen, ...cfg.decisionModels.filter((m) => !chosen.includes(m))];
+	cfg.preferred = chosen.map((m) => m.match);
+}
+
+/** Persist the preference (used by /jev-use). Returns the file written. */
+export function writeModelPreference(preference: string): string {
+	const file = adapterLocalPath();
+	let existing: Record<string, unknown> = {};
+	try {
+		existing = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+	} catch {
+		/* new file */
+	}
+	const prev = Array.isArray(existing.prefer) ? (existing.prefer as unknown[]).filter((p): p is string => typeof p === "string") : [];
+	existing.prefer = [preference, ...prev.filter((p) => !looseMatch(p, preference))];
+	mkdirSync(dirname(file), { recursive: true });
+	writeFileSync(file, JSON.stringify(existing, null, 2) + "\n");
+	configCache.clear();
+	endpointCache.clear();
+	return file;
+}
+
+/** Live model list from the endpoint itself (`GET {baseURL}/models`). */
+export async function listServedModels(
+	cfg: ResolvedJevConfig,
+	signal?: AbortSignal,
+): Promise<{ ok: boolean; models: string[]; error?: string }> {
+	try {
+		const res = await fetch(`${cfg.baseURL}/models`, {
+			headers: cfg.apiKey ? { Authorization: `Bearer ${cfg.apiKey}` } : {},
+			signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(10000)]) : AbortSignal.timeout(10000),
+		});
+		if (!res.ok) return { ok: false, models: [], error: `HTTP ${res.status}` };
+		const data = (await res.json()) as { data?: { id?: string }[] };
+		return { ok: true, models: (data.data ?? []).map((m) => m.id ?? "").filter(Boolean) };
+	} catch (e) {
+		return { ok: false, models: [], error: (e as Error).message };
+	}
 }
 
 /** Built-in last resort; `defaults` in the config file normally overrides these. */
@@ -187,6 +277,19 @@ const BUILTIN_TUNING: Required<JevTuning> = {
 };
 
 const CONFIG_FILENAME = "jev-adapter.config.json";
+const LOCAL_FILENAME = "jev-adapter.local.json";
+
+/** Case-insensitive, either-direction substring match: "glm" ↔ "GLM-5.3-Flash". */
+function looseMatch(a: string, b: string): boolean {
+	const x = a.toLowerCase();
+	const y = b.toLowerCase();
+	return x.includes(y) || y.includes(x);
+}
+
+/** Public matcher for config entry names ("glm", "qwen3.8", full ids). */
+export function nameMatches(a: string, b: string): boolean {
+	return looseMatch(a, b);
+}
 
 /** This module's directory, tolerant of jiti (CJS) and plain node (ESM) hosts. */
 const EXT_DIR = (() => {
@@ -307,7 +410,8 @@ const configCache = new Map<string, AdapterConfigFile>();
 export function loadAdapterConfig(path?: string): AdapterConfigFile {
 	const { paths, explicit } = adapterConfigPaths();
 	const wanted = path ? [expandHome(path)] : paths;
-	const key = `${wanted.map(statKey).join("|")}:${explicit ? "x" : "s"}`;
+	const localFile = adapterLocalPath();
+	const key = `${wanted.map(statKey).join("|")}:${explicit ? "x" : "s"}:${statKey(localFile)}:${process.env.JEV_USE_MODEL ?? ""}`;
 	const cached = configCache.get(key);
 	if (cached) return cached;
 
@@ -347,11 +451,19 @@ export function loadAdapterConfig(path?: string): AdapterConfigFile {
 		source: chosen ? "file" : "builtin",
 		defaults: validateTuning(parsed.defaults, "defaults", problems),
 		decisionModels: validateProfiles(parsed.decisionModels, "decisionModels", problems),
+		preferred: [],
+		localPath: null,
 		problems,
 	};
 	if (chosen && !cfg.decisionModels.length) {
 		problems.push(`${chosen}: no usable decisionModels entries — the model must come from JEV_MODEL / a models.json lookup by name`);
 	}
+	// Switching between two endpoints: $JEV_USE_MODEL (this process) then the local
+	// override file (/jev-use) both reorder decisionModels without editing the file.
+	const local = loadPreferenceOverride();
+	problems.push(...local.problems);
+	cfg.localPath = local.path;
+	applyPreference(cfg, [...(process.env.JEV_USE_MODEL ? [process.env.JEV_USE_MODEL] : []), ...local.prefer]);
 	configCache.set(key, cfg);
 	return cfg;
 }
@@ -677,6 +789,14 @@ export type ResolvedJevConfig = Required<JevAdapterConfig> & {
 	effortRequested?: string;
 	/** set when the requested effort had no sendable translation (field omitted). */
 	effortDropped?: string;
+	/** active model preference (empty = plain config file order). */
+	preferred: string[];
+	/**
+	 * The top preference was not declared in models.json, so the next entry in order
+	 * answered. Silent fallback across endpoints is dangerous here (the effort
+	 * semantics differ per endpoint), so it is reported, not hidden.
+	 */
+	preferredNotServed?: string;
 	/** config validation problems that mattered to this resolution. */
 	configProblems: string[];
 };
@@ -721,6 +841,13 @@ export function resolveConfig(opts: JevAdapterConfig = {}): ResolvedJevConfig {
 		cfg.defaults.reasoningEffort ??
 		BUILTIN_TUNING.reasoningEffort;
 	const clamped = clampEffort(effortRequested, profile);
+	// Loud fallback: the preferred endpoint was not found among the declared models,
+	// so a later entry answered. Say so — the caller may be assuming this endpoint's
+	// effort vocabulary and latency.
+	const preferredNotServed =
+		!requestedModel && cfg.preferred.length && !(profile && nameMatches(cfg.preferred[0], profile.match))
+			? cfg.preferred[0]
+			: undefined;
 	return {
 		baseURL,
 		apiKey: opts.apiKey ?? process.env.JEV_API_KEY ?? endpoint?.apiKey ?? "",
@@ -738,6 +865,8 @@ export function resolveConfig(opts: JevAdapterConfig = {}): ResolvedJevConfig {
 		configPath: cfg.path,
 		matchedBy: profile?.match,
 		profileNote: profile?.note,
+		preferred: cfg.preferred,
+		...(preferredNotServed ? { preferredNotServed } : {}),
 		effortApplied: clamped.applied,
 		...(clamped.requested && clamped.requested !== clamped.applied
 			? { effortRequested: clamped.requested, ...(clamped.dropped ? { effortDropped: clamped.requested } : {}) }
@@ -751,7 +880,7 @@ function effortFields(
 	cfg: ResolvedJevConfig,
 	/** set when the server itself rejected the effort (HTTP 400) and we retried without it */
 	serverRejected?: string,
-): Pick<JevDecisionResult, "model" | "reasoningEffort" | "effortClampedFrom" | "effortDropped"> {
+): Pick<JevDecisionResult, "model" | "reasoningEffort" | "effortClampedFrom" | "effortDropped" | "modelFallbackFrom"> {
 	const dropped = cfg.effortDropped ?? serverRejected;
 	return {
 		model: cfg.model,
@@ -759,6 +888,7 @@ function effortFields(
 		reasoningEffort: serverRejected ? "" : cfg.effortApplied,
 		...(cfg.effortRequested ? { effortClampedFrom: cfg.effortRequested } : {}),
 		...(dropped ? { effortDropped: dropped } : {}),
+		...(cfg.preferredNotServed ? { modelFallbackFrom: cfg.preferredNotServed } : {}),
 	};
 }
 
@@ -867,6 +997,24 @@ async function callOpenAiCompatible(
 				sendEffort = "";
 				lastErr = `HTTP 400: reasoning_effort "${effortRejected}" rejected, retrying without it`;
 				continue;
+			}
+			// Switching endpoints leaves a window where the box serves the OTHER model
+			// (one GPU, one vLLM process). "model does not exist" is that case, and an
+			// opaque 404 dump wastes a whole debugging round — ask the endpoint what it
+			// does serve and say so.
+			if (
+				(res.status === 400 || res.status === 404) &&
+				/model/i.test(body) &&
+				/does not exist|not found|unknown model|invalid model/i.test(body)
+			) {
+				const served = await listServedModels(cfg);
+				lastErr =
+					`HTTP ${res.status}: the endpoint at ${cfg.baseURL} does not serve "${cfg.model}"` +
+					(served.ok
+						? ` — it currently serves ${served.models.length ? served.models.join(", ") : "(nothing)"}`
+						: ` (live /models probe failed: ${served.error})`) +
+					`. Is the other decision server up? Switch the model with /jev-use <name> (current preference lives in ${adapterLocalPath()}).`;
+				break;
 			}
 			lastErr = `HTTP ${res.status}: ${body}`;
 			break;
