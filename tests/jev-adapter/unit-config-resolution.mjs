@@ -233,6 +233,52 @@ writeFileSync(localFile, JSON.stringify({ prefer: ["qwen"] }));
 r = resolveConfig();
 check("no false alarm when the preference IS the served model", r.preferredNotServed === undefined && r.model.includes("Qwen"), JSON.stringify({ m: r.model, f: r.preferredNotServed }));
 
+// --- 9. the SHIPPED config must match the real ids these two endpoints load ---
+const realIds = write("models-real.json", {
+	providers: {
+		"local-llm": {
+			baseUrl: "http://real.example:8000/v1",
+			apiKey: "k",
+			models: [
+				{ id: "local-inference-lab/Qwen3.8-Flash-Next-NVFP4" },
+				{ id: "local-inference-lab/GLM-5.3-Flash-NVFP4-Spark" },
+			],
+		},
+	},
+});
+process.env.JEV_MODELS_JSON = realIds;
+delete process.env.JEV_CONFIG; // exercise the file that actually ships
+process.env.JEV_LOCAL = join(dir, "no-override.json");
+const shipped = loadAdapterConfig();
+check("shipped jev-adapter.config.json is the one loaded", String(shipped.path).endsWith("jev-adapter.config.json"), String(shipped.path));
+check("shipped config has no validation problems", shipped.problems.length === 0, JSON.stringify(shipped.problems));
+const realIdsList = ["local-inference-lab/Qwen3.8-Flash-Next-NVFP4", "local-inference-lab/GLM-5.3-Flash-NVFP4-Spark"];
+check(
+	"shipped config pins both real model ids exactly",
+	realIdsList.every((id) => shipped.decisionModels.some((m) => m.match === id)),
+	JSON.stringify(shipped.decisionModels.map((m) => m.match)),
+);
+r = resolveConfig();
+check("default resolution → Qwen (first entry)", r.model === realIdsList[0], r.model);
+check("…with no preference fallback warning", r.preferredNotServed === undefined, String(r.preferredNotServed));
+process.env.JEV_USE_MODEL = "glm"; // what /jev-use glm persists
+r = resolveConfig();
+check("preferring GLM resolves the exact Spark id", r.model === realIdsList[1], r.model);
+check("…and no silent fallback", r.preferredNotServed === undefined && r.matchedBy === realIdsList[1], JSON.stringify({ m: r.matchedBy, f: r.preferredNotServed }));
+const glm = shipped.decisionModels.find((m) => m.match.includes("GLM"));
+check(
+	"GLM entry carries ITS OWN effort vocabulary (all pi levels sendable, default low)",
+	glm?.supportedEfforts?.length === 7 && glm?.reasoningEffort === "low" && !glm?.effortMap,
+	JSON.stringify({ s: glm?.supportedEfforts, e: glm?.reasoningEffort, m: glm?.effortMap }),
+);
+check(
+	"GLM effortGuide says the opposite of Qwen's (low fast, avoid none)",
+	/low/.test(glm?.effortGuide ?? "") && /none/.test(glm?.effortGuide ?? "") && !/ONLY latency switch/.test(glm?.effortGuide ?? ""),
+	String(glm?.effortGuide),
+);
+check("GLM entry has no sendability contradiction with its own default", !shipped.problems.some((p) => /GLM/.test(p)), JSON.stringify(shipped.problems));
+delete process.env.JEV_USE_MODEL;
+
 delete process.env.JEV_LOCAL;
 
 rmSync(dir, { recursive: true, force: true });

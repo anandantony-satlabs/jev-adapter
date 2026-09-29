@@ -17,22 +17,25 @@ fetch-mocked unit tests that need no endpoint.
   "defaults": { "reasoningEffort": "low", "maxTokens": 4000, "timeoutMs": 180000, "retries": 3, "responseFormat": "json_object" },
   "decisionModels": [
     {
-      "match": "Qwen3.8-Flash-Next-NVFP4",
+      "match": "local-inference-lab/Qwen3.8-Flash-Next-NVFP4",
       "reasoningEffort": "low",
       "supportedEfforts": ["none", "low", "medium", "xhigh"],
       "effortMap": { "minimal": "low", "high": "xhigh", "max": "xhigh" },
       "effortGuide": "short how-to-pick text, rendered into the tool description (prompt tokens — keep it lean)",
       "note": "long-form measured behaviour of this endpoint — shown by /jev-config"
     },
-    { "match": "GLM-5.3-Flash", "reasoningEffort": "low", "note": "fallback / rollback entry" }
+    { "match": "local-inference-lab/GLM-5.3-Flash-NVFP4-Spark", "reasoningEffort": "low", "note": "fallback / rollback entry" }
   ]
 }
 ```
 
 * `decisionModels` is a **preference list**: the first entry whose `match` (exact id, or a
   substring of one) appears in a model id in `~/.pi/agent/models.json` wins. **Switching
-  endpoints = reorder or edit this list**, or edit it at the user level — no code change,
-  no rebuild.
+  endpoints is `/jev-use` (below), not an edit** — the list itself rarely changes.
+* `match` is pinned to the **exact id the server loads**, so one endpoint's tuning and effort
+  vocabulary cannot leak onto another build of the same family (a non-Spark GLM, a newer Qwen
+  revision). Use a substring when you *want* one entry to cover variants; add a separate entry
+  when a variant behaves differently.
 * This file holds **model ids and tuning only** — never URLs or keys. Those come from
   `~/.pi/agent/models.json` (or env overrides), and stay out of git.
 * Search order: `$JEV_CONFIG` → `<extension dir>/jev-adapter.config.json` →
@@ -46,9 +49,10 @@ fetch-mocked unit tests that need no endpoint.
 
 ## Switching between two decision models
 
-Switching is expected to happen back and forth (e.g. `GLM-5.3-Flash` ↔
-`Qwen3.8-Flash-Next-NVFP4`, one GPU running one vLLM process), so it is a command, not an
-edit:
+Switching is expected to happen back and forth (e.g.
+`local-inference-lab/GLM-5.3-Flash-NVFP4-Spark` ↔
+`local-inference-lab/Qwen3.8-Flash-Next-NVFP4`, one GPU running one vLLM process), so it is
+a command, not an edit:
 
 ```
 /jev-use                 # list candidates + what the endpoint actually serves right now
