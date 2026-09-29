@@ -109,6 +109,12 @@ export interface JevDecisionResult {
 	modelFallbackFrom?: string;
 	/** Set when the server rejected the requested effort outright (sent without the field). */
 	effortDropped?: string;
+	/** Set when an attempt was cut off by `max_tokens` (finish_reason="length") and
+	 *  the retry ran with a larger output budget. A truncation is the most common
+	 *  cause of "Could not parse JSON": the answer is simply incomplete. */
+	maxTokensRaisedFrom?: number;
+	/** Pre-flight output-budget estimate for this call (see estimateOutputBudget). */
+	budget?: JevBudgetEstimate;
 }
 
 /** Multi-state batch result: answers[stateId][questionId]. */
@@ -130,6 +136,8 @@ export interface JevBatchResult {
 	effortClampedFrom?: string;
 	effortDropped?: string;
 	modelFallbackFrom?: string;
+	maxTokensRaisedFrom?: number;
+	budget?: JevBudgetEstimate;
 }
 
 /* ------------------------------------------------------------------ */
@@ -270,7 +278,11 @@ export async function listServedModels(
 /** Built-in last resort; `defaults` in the config file normally overrides these. */
 const BUILTIN_TUNING: Required<JevTuning> = {
 	reasoningEffort: "low",
-	maxTokens: 4000,
+	// 4000 was measured too small: a 10-state x 3-question batch of score
+	// questions decodes ~7.5k completion tokens and came back truncated
+	// ("Could not parse JSON" after every retry, no rescue possible). See
+	// estimateOutputBudget() for the per-answer decode costs.
+	maxTokens: 8000,
 	timeoutMs: 180000,
 	retries: 3,
 	responseFormat: "json_object",
@@ -933,16 +945,83 @@ export function describeJevConfig(): JevConfigReport {
 	};
 }
 
+/* ------------------------------------------------------------------ */
+/* Output budget                                                       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Measured decode cost per answered question (thinking effort, temp 0) — what
+ * a `max_tokens` budget has to cover. A score answer emits a whole level
+ * distribution, a boolean answer one number:
+ *   10 states x [score, score, boolean]  measured 7545 out  (~250/answer)
+ *    6 states x [score, score, boolean]  measured 3380 out  (~190/answer)
+ *    9 states x [choice, boolean]        measured 2077 out  (~115/answer)
+ * Long state digests push score answers up, so these skew pessimistic for
+ * boolean-heavy calls. Prefill (the state text itself) is ~100x cheaper and is
+ * deliberately NOT counted here.
+ */
+const OUTPUT_TOKENS_PER_ANSWER: Record<string, number> = {
+	score: 280,
+	choice: 160,
+	boolean: 130,
+};
+
+/** Ceiling for the automatic max_tokens raise (see runDecide). */
+const MAX_TOKENS_CEILING = 32000;
+
+export interface JevBudgetEstimate {
+	/** states x questions — the decode surface. */
+	answers: number;
+	estOutputTokens: number;
+	maxTokens: number;
+	/** 1 = expected to fit in one response; >1 = split the batch into this many calls. */
+	chunks: number;
+}
+
+/**
+ * Pre-flight check that a call's OUTPUT can fit in one response.
+ *
+ * Decode is the latency bottleneck (~60 tok/s against ~5000 tok/s prefill) and a
+ * request that overruns `max_tokens` does not fail gracefully: the JSON comes
+ * back cut off mid-object, extractJson fails, and every retry fails the same way
+ * because the shape never changed — the whole batch is lost and the caller has
+ * to re-derive its digests. Saying so before spending the round trips is the
+ * cheapest fix available; runDecide additionally auto-raises on truncation.
+ */
+export function estimateOutputBudget(
+	stateCount: number,
+	questions: Record<string, JevQuestion>,
+	maxTokens: number,
+): JevBudgetEstimate {
+	const qids = Object.keys(questions ?? {});
+	const perState = qids.reduce(
+		(sum, qid) => sum + (OUTPUT_TOKENS_PER_ANSWER[questions[qid]?.type] ?? 200),
+		0,
+	);
+	const states = Math.max(1, stateCount);
+	const estOutputTokens = states * (perState || 200);
+	return {
+		answers: states * Math.max(1, qids.length),
+		estOutputTokens,
+		maxTokens,
+		chunks: Math.max(1, Math.ceil(estOutputTokens / Math.max(1, maxTokens))),
+	};
+}
+
 async function callOpenAiCompatible(
 	cfg: ResolvedJevConfig,
 	prompt: string,
 	signal?: AbortSignal,
+	/** per-attempt override, raised when a previous attempt was cut off */
+	maxTokens?: number,
 ): Promise<{
 	raw: string;
 	usage?: { inputTokens: number; outputTokens: number };
 	attempts: number;
 	/** set when the server rejected our reasoning_effort (400) and we retried without it */
 	effortRejected?: string;
+	/** set when the response hit the output limit (finish_reason="length") */
+	truncated?: boolean;
 }> {
 	let lastErr = "";
 	// Local, mutable copy: an endpoint whose effort vocabulary we don't know
@@ -966,7 +1045,7 @@ async function callOpenAiCompatible(
 						{ role: "system", content: "You are a rigorous decision scorer. Output JSON only." },
 						{ role: "user", content: prompt },
 					],
-					max_tokens: cfg.maxTokens,
+					max_tokens: maxTokens ?? cfg.maxTokens,
 					temperature: 0,
 					...(sendEffort ? { reasoning_effort: sendEffort } : {}),
 					...(cfg.responseFormat && cfg.responseFormat !== "none"
@@ -1020,7 +1099,10 @@ async function callOpenAiCompatible(
 			break;
 		}
 		const data = (await res.json()) as {
-			choices?: { message?: { content?: string; reasoning_content?: string } }[];
+			choices?: {
+				message?: { content?: string; reasoning_content?: string };
+				finish_reason?: string;
+			}[];
 			usage?: { prompt_tokens?: number; completion_tokens?: number };
 		};
 		// Thinking models often leave content empty and put the answer
@@ -1035,6 +1117,7 @@ async function callOpenAiCompatible(
 					}
 				: undefined,
 			attempts: attempt + 1,
+			...(data.choices?.[0]?.finish_reason === "length" ? { truncated: true } : {}),
 			...(effortRejected ? { effortRejected } : {}),
 		};
 	}
@@ -1136,7 +1219,7 @@ export async function decide(
 		);
 	}
 	const { prompt, parse } = runDecide(cfg, buildPrompt(state, questions), signal);
-	const { usage, elapsedMs, attempts, parsed, firstFailedRaw, effortRejected } = await parse();
+	const { usage, elapsedMs, attempts, parsed, firstFailedRaw, effortRejected, maxTokensRaisedFrom } = await parse();
 	const answers = assembleAnswers(questions, parsed);
 	if (!Object.keys(answers).length) {
 		throw new Error("Model output JSON matched none of the question IDs");
@@ -1151,6 +1234,8 @@ export async function decide(
 		elapsedMs,
 		attempts,
 		...effortFields(cfg, effortRejected),
+		...(maxTokensRaisedFrom ? { maxTokensRaisedFrom } : {}),
+		budget: estimateOutputBudget(1, questions, cfg.maxTokens),
 		...(missingQuestions.length ? { missingQuestions } : {}),
 		...(firstFailedRaw ? { debug: { firstFailedRaw } } : {}),
 	};
@@ -1182,7 +1267,7 @@ export async function decideBatch(
 		);
 	}
 	const { prompt, parse } = runDecide(cfg, buildPromptBatch(entries, questions), signal);
-	const { usage, elapsedMs, attempts, parsed, firstFailedRaw, effortRejected } = await parse();
+	const { usage, elapsedMs, attempts, parsed, firstFailedRaw, effortRejected, maxTokensRaisedFrom } = await parse();
 	const answers: JevBatchResult["answers"] = {};
 	const missingStates: string[] = [];
 	// question id -> state ids that answered the batch but dropped this question
@@ -1222,6 +1307,8 @@ export async function decideBatch(
 		elapsedMs,
 		attempts,
 		...effortFields(cfg, effortRejected),
+		...(maxTokensRaisedFrom ? { maxTokensRaisedFrom } : {}),
+		budget: estimateOutputBudget(entries.length, questions, cfg.maxTokens),
 		...(missingStates.length ? { missingStates } : {}),
 		...(missingQuestions.size
 			? { missingQuestions: Object.fromEntries(missingQuestions) }
@@ -1246,6 +1333,8 @@ function runDecide(
 		firstFailedRaw?: string;
 		/** Present when the server rejected our reasoning_effort (400) and we retried without it. */
 		effortRejected?: string;
+		/** Present when an attempt was cut off by max_tokens and the retry got a bigger budget. */
+		maxTokensRaisedFrom?: number;
 	}>;
 } {
 	return {
@@ -1260,9 +1349,11 @@ function runDecide(
 			let parsed: Record<string, unknown> | null = null;
 			let firstFailedRaw: string | undefined;
 			let effortRejected: string | undefined;
+			let maxTokens = cfg.maxTokens;
+			let maxTokensRaisedFrom: number | undefined;
 			while (!parsed && attempts < cfg.retries) {
 				attempts += 1; // attempts = number of requests actually made
-				const r = await callOpenAiCompatible(cfg, prompt, signal);
+				const r = await callOpenAiCompatible(cfg, prompt, signal, maxTokens);
 				if (r.effortRejected) effortRejected = r.effortRejected;
 				raw = r.raw;
 				// usage accumulates across attempts so the token accounting stays honest
@@ -1274,14 +1365,33 @@ function runDecide(
 					: r.usage;
 				parsed = extractJson(raw);
 				if (!parsed && attempts === 1) firstFailedRaw = String(raw).slice(0, 400);
+				// Truncation is the one failure a blind retry cannot rescue: the same shape
+				// overruns the same budget every time and the whole batch is lost. Raise the
+				// output budget for the next attempt instead of asking again.
+				if (!parsed && r.truncated && maxTokens < MAX_TOKENS_CEILING) {
+					maxTokensRaisedFrom ??= maxTokens;
+					maxTokens = Math.min(maxTokens * 2, MAX_TOKENS_CEILING);
+				}
 			}
 			const elapsedMs = Date.now() - t0;
 			if (!parsed) {
 				throw new Error(
-					`Could not parse JSON from model output after ${attempts} attempt(s) (last 200 chars: ${String(raw).slice(-200)})`,
+					`Could not parse JSON from model output after ${attempts} attempt(s)` +
+						(maxTokensRaisedFrom
+							? ` - the answer kept being cut off by the output limit (last tried: ${maxTokens} tokens), so this batch is too big for one response: split it into smaller calls (fewer states, or fewer score questions per call)`
+							: "") +
+						` (last 200 chars: ${String(raw).slice(-200)})`,
 				);
 			}
-			return { usage, elapsedMs, attempts, parsed, firstFailedRaw, ...(effortRejected ? { effortRejected } : {}) };
+			return {
+				usage,
+				elapsedMs,
+				attempts,
+				parsed,
+				firstFailedRaw,
+				...(effortRejected ? { effortRejected } : {}),
+				...(maxTokensRaisedFrom ? { maxTokensRaisedFrom } : {}),
+			};
 		},
 	};
 }

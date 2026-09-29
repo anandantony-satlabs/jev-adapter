@@ -31,11 +31,22 @@
     "tuning and the effort vocabulary switch with the model automatically — those differ between",
     "these two (on Qwen only 'none' is fast; on GLM 'low' is the fast switch). /jev-config shows",
     "which preference is active, what models.json declares, and what the endpoint serves right now",
-    "(one GPU usually runs one decision model, so 'saved but not served' is a real state)."
+    "(one GPU usually runs one decision model, so 'saved but not served' is a real state).",
+    "",
+    "WHY maxTokens IS 8000 AND NOT SMALLER (measured 2026-09-29, real 20-commit review):",
+    "the endpoint decodes ~60 tok/s against ~5000 tok/s prefill, so the OUTPUT budget is the",
+    "constraint, not the input size. Per answered question: score ~250-280 tokens (a whole level",
+    "distribution), choice ~150, boolean ~120. A 10-state x [score,score,boolean] batch measured",
+    "7545 output tokens: at 4000 that batch was cut off mid-object, unparseable, and all three",
+    "retries failed identically - a truncated batch is a total loss, not a partial result.",
+    "adapter.ts estimateOutputBudget() now predicts this before the call (surfaced as est_out in",
+    "the perf line + a WARNING when chunks > 1) and runDecide auto-raises max_tokens on",
+    "finish_reason=length. Rule of thumb: ~6 states x 3 questions with rich state text is the",
+    "safe shape; if you need more items, split into several calls rather than raising this blind."
   ],
   "defaults": {
     "reasoningEffort": "low",
-    "maxTokens": 4000,
+    "maxTokens": 8000,
     "timeoutMs": 180000,
     "retries": 3,
     "responseFormat": "json_object"

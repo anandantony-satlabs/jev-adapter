@@ -103,6 +103,10 @@ const preferGlm = cfgFor(
 		],
 	},
 );
+// Isolate from the OPERATOR's preference file: anyone who has run /jev-use once has
+// ~/.pi/agent/jev-adapter.local.json, whose prefer[] reorders this temp config back
+// and makes the reorder assertion fail on their machine, not in the code.
+process.env.JEV_LOCAL = join(dir, "no-preference-yet.json");
 process.env.JEV_CONFIG = preferGlm;
 r = resolveConfig();
 check("config: reordering decisionModels switches the model", r.model.includes("GLM"), r.model);

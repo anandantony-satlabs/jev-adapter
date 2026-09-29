@@ -14,7 +14,7 @@ fetch-mocked unit tests that need no endpoint.
 
 ```json
 {
-  "defaults": { "reasoningEffort": "low", "maxTokens": 4000, "timeoutMs": 180000, "retries": 3, "responseFormat": "json_object" },
+  "defaults": { "reasoningEffort": "low", "maxTokens": 8000, "timeoutMs": 180000, "retries": 3, "responseFormat": "json_object" },
   "decisionModels": [
     {
       "match": "local-inference-lab/Qwen3.8-Flash-Next-NVFP4",
@@ -123,7 +123,13 @@ the parse-retry tier at zero latency/behaviour cost. Do **not** set `json_schema
 decoding at temp 0 collapses every answer to one-hot argmax and cannot express sum-to-1.
 
 Each result reports `model`, `effort`, `elapsed`, `attempts` (requests actually made — >1 means
-a retry rescued the call) and token `usage` in its `perf:` line.
+a retry rescued the call) and token `usage` in its `perf:` line — plus `est_out`, the predicted
+output-token cost of the answer set (score ≈280, choice ≈160, boolean ≈130 tokens per answer).
+Decode is the bottleneck on a local endpoint (~60 tok/s vs ~5000 tok/s prefill) and a response
+cut off by `max_tokens` is a *total* loss, not a partial one: the JSON will not parse and
+re-asking the same shape fails the same way. So the tool warns up front when the batch cannot fit
+(`chunks > 1`), and `runDecide` raises `max_tokens` once on `finish_reason=length` and reports
+`maxTokensRaisedFrom` rather than burning all three retries on the same mistake.
 
 ## Inspecting / verifying the setup
 
@@ -137,6 +143,7 @@ a retry rescued the call) and token `usage` in its `perf:` line.
 ```
 node tests/jev-adapter/unit-config-resolution.mjs   # config/preference/switch/clamp logic, mocked fetch
 node tests/jev-adapter/unit-missing-questions.mjs   # partial-answer accounting, mocked fetch
+node tests/jev-adapter/unit-output-budget.mjs       # output-budget estimator + truncation rescue, mocked fetch
 ```
 
 ## Usage

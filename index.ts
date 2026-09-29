@@ -27,6 +27,7 @@ import {
 	adapterLocalPath,
 	decide,
 	decideBatch,
+	type JevBudgetEstimate,
 	describeJevConfig,
 	listServedModels,
 	nameMatches,
@@ -67,7 +68,7 @@ const jevDecideTool = defineTool({
 		"Not for text generation, explanations, or multi-step reasoning — use a normal model for those.",
 		"",
 		"You may ask many questions in one call; 1 and 10 questions cost about the same, so batch every judgement you might need.",
-		"To judge MULTIPLE independent states (commits, tickets, diffs) against the SAME questions, pass `states` instead of `state` — one batched call beats N parallel calls (the local endpoint serializes on the GPU). Output decode scales with states×questions, so keep both lean; ideal: ≤10 states × ≤6 questions.",
+		"To judge MULTIPLE independent states (commits, tickets, diffs) against the SAME questions, pass `states` instead of `state` — one batched call beats N parallel calls (the local endpoint serializes on the GPU). Output decode scales with states×questions: budget ~280 output tokens per score answer, ~160 per choice, ~130 per boolean, and the whole answer set must fit in one response (max_tokens) or it comes back unparseable. Measured ceiling with rich (50+ word) states: ~6 states × 3 questions at low effort; ~10 × 3 only if the answer total stays under max_tokens.",
 		"Each question must be one atomic, single-dimension judgement; compose complex logic from the answers yourself.",
 		"choice and score answers include probabilities and a confidence score (distribution shape, 0-1, NOT a correctness guarantee);",
 		"boolean answers return probability = P(true) with no confidence.",
@@ -100,7 +101,7 @@ const jevDecideTool = defineTool({
 				],
 				{
 					description:
-						"Batch mode: judge MULTIPLE independent states against the SAME questions in ONE call (beats N parallel tool calls; the endpoint serializes on the GPU). Mutually exclusive with `state`. Keep it lean: ≤10 states × ≤6 questions.",
+						"Batch mode: judge MULTIPLE independent states against the SAME questions in ONE call (beats N parallel tool calls; the endpoint serializes on the GPU). Mutually exclusive with `state`. Budget the OUTPUT, not just the count: states × (sum of per-question decode costs: score ~280, choice ~160, boolean ~130 tokens) must fit under max_tokens, so ~6 states × 3 questions with rich state text is the safe shape.",
 				},
 			),
 		),
@@ -230,7 +231,21 @@ const jevDecideTool = defineTool({
 		if (result.elapsedMs !== undefined) meta.push(`elapsed=${(result.elapsedMs / 1000).toFixed(1)}s`);
 		if (result.attempts !== undefined && result.attempts > 1) meta.push(`attempts=${result.attempts} (retried)`);
 		if (result.usage) meta.push(`tokens in/out=${result.usage.inputTokens}/${result.usage.outputTokens}`);
+		const budget = (result as unknown as { budget?: JevBudgetEstimate }).budget;
+		const raised = (result as unknown as { maxTokensRaisedFrom?: number }).maxTokensRaisedFrom;
+		// est_out next to the real out-token count keeps the per-answer decode costs
+		// in estimateOutputBudget() honest every time the tool is called.
+		if (budget) meta.push(`est_out=${budget.estOutputTokens}`);
 		if (meta.length) lines.push(`perf: ${meta.join("  ")}`);
+		if (raised) {
+			lines.push(
+				`WARNING: an attempt was cut off at ${raised} output tokens and retried with a raised max_tokens. The batch was too big for one response - shrink it (fewer states, or fewer score questions) rather than relying on the rescue: each raise costs a whole extra decode pass.`,
+			);
+		} else if (budget && budget.chunks > 1) {
+			lines.push(
+				`WARNING: ~${budget.estOutputTokens} output tokens needed for ${budget.answers} answers but max_tokens=${budget.maxTokens} - split into ~${budget.chunks} calls. A cut-off answer is not partially usable: the JSON will not parse and every retry fails the same way.`,
+			);
+		}
 
 		return {
 			content: [{ type: "text", text: lines.join("\n") }],
