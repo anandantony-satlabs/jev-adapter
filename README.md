@@ -125,11 +125,18 @@ decoding at temp 0 collapses every answer to one-hot argmax and cannot express s
 Each result reports `model`, `effort`, `elapsed`, `attempts` (requests actually made — >1 means
 a retry rescued the call) and token `usage` in its `perf:` line — plus `est_out`, the predicted
 output-token cost of the answer set (score ≈280, choice ≈160, boolean ≈130 tokens per answer).
-Decode is the bottleneck on a local endpoint (~60 tok/s vs ~5000 tok/s prefill) and a response
+Decode is the bottleneck on this kind of endpoint (~60 tok/s vs ~5000 tok/s prefill) and a response
 cut off by `max_tokens` is a *total* loss, not a partial one: the JSON will not parse and
 re-asking the same shape fails the same way. So the tool warns up front when the batch cannot fit
 (`chunks > 1`), and `runDecide` raises `max_tokens` once on `finish_reason=length` and reports
 `maxTokensRaisedFrom` rather than burning all three retries on the same mistake.
+
+Where the endpoint lives also matters. If `/jev-config` prints **SAME ENDPOINT AS THE AGENT**, the
+decisions decode on the same server (often the same weights, `$PI_MODEL`) that generates the
+agent's own tokens — the harness sitting on another box changes nothing. There, JEV buys *context
+window*, not compute; `elapsed` is contended-state rather than endpoint capability; and `/jev-use`
+would load different weights into the server the running session is generating from, so it prints a
+**SWITCH RISK** warning first.
 
 ## Inspecting / verifying the setup
 
@@ -144,6 +151,7 @@ re-asking the same shape fails the same way. So the tool warns up front when the
 node tests/jev-adapter/unit-config-resolution.mjs   # config/preference/switch/clamp logic, mocked fetch
 node tests/jev-adapter/unit-missing-questions.mjs   # partial-answer accounting, mocked fetch
 node tests/jev-adapter/unit-output-budget.mjs       # output-budget estimator + truncation rescue, mocked fetch
+node tests/jev-adapter/unit-shared-endpoint.mjs     # $PI_MODEL / decision-endpoint co-residency detection
 ```
 
 ## Usage

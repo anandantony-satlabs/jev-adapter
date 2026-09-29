@@ -27,6 +27,7 @@ import {
 	adapterLocalPath,
 	decide,
 	decideBatch,
+	detectSharedAgentEndpoint,
 	type JevBudgetEstimate,
 	describeJevConfig,
 	listServedModels,
@@ -330,6 +331,9 @@ export default function (pi: ExtensionAPI) {
 				}`,
 			);
 			if (cfg?.profileNote) lines.push(`note: ${cfg.profileNote}`);
+			if (report.sharedEndpoint) {
+				lines.push(`SAME ENDPOINT AS THE AGENT: ${report.sharedEndpoint.basis}. ${report.sharedEndpoint.note}`);
+			}
 			if (report.problems.length) lines.push(`CONFIG PROBLEMS: ${report.problems.join(" | ")}`);
 
 			// "/jev-config check" — one real decision at the CONFIG DEFAULT effort, so
@@ -403,6 +407,12 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			const cand = report.candidates.find((c) => c.match === cfg.matchedBy);
+			const sharedNow = detectSharedAgentEndpoint(cfg);
+			if (sharedNow?.shared) {
+				lines.push(
+					`SWITCH RISK: ${sharedNow.basis}. Switching decision models here loads different weights into the server THIS session generates from — only do it when the session can be restarted, or point JEV_BASE_URL at a second server. ${sharedNow.note}`,
+				);
+			}
 			if (cfg.preferredNotServed) {
 				lines.push(
 					`NOTICE: preferred "${cfg.preferredNotServed}" is not declared in ~/.pi/agent/models.json, so "${cfg.matchedBy}" answers instead — DIFFERENT effort vocabulary and latency. Start the other server (and declare its model in models.json), or /jev-use <available>.`,

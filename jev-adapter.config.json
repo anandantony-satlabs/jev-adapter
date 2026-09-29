@@ -42,7 +42,20 @@
     "adapter.ts estimateOutputBudget() now predicts this before the call (surfaced as est_out in",
     "the perf line + a WARNING when chunks > 1) and runDecide auto-raises max_tokens on",
     "finish_reason=length. Rule of thumb: ~6 states x 3 questions with rich state text is the",
-    "safe shape; if you need more items, split into several calls rather than raising this blind."
+    "safe shape; if you need more items, split into several calls rather than raising this blind.",
+    "",
+    "TOPOLOGY (corrected 2026-09-29): 'local endpoint' in these notes means SAME SITE, not the",
+    "harness machine. The agent harness runs on its own box; the decision model is served by a",
+    "separate GPU box — and on this setup that box ALSO serves the agent's own inference (same",
+    "model id, one vLLM process), reached over the tailnet (~57ms RTT against 30-115s calls, so",
+    "the network is irrelevant). Consequences: JEV buys CONTEXT WINDOW, not compute (each answer",
+    "decodes on the accelerator that generates the agent's tokens); elapsedMs measured during a",
+    "live session is contended-state, not endpoint capability; and /jev-use there loads different",
+    "weights into the server the running session is generating from. adapter.ts",
+    "detectSharedAgentEndpoint() compares $PI_MODEL's models.json origin against the decision",
+    "baseURL, /jev-config prints 'SAME ENDPOINT AS THE AGENT' when they coincide, and /jev-use",
+    "prints a SWITCH RISK warning there. Read that line before quoting a latency number or",
+    "switching decision models."
   ],
   "defaults": {
     "reasoningEffort": "low",

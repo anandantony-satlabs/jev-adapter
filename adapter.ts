@@ -914,6 +914,76 @@ export interface JevConfigReport {
 	candidates: { match: string; selected: boolean; note?: string; effortGuide?: string; reasoningEffort?: string; supportedEfforts?: string[] }[];
 	resolved: ResolvedJevConfig | null;
 	error?: string;
+	/** null = not detectable; set when the agent's own tokens come from this server. */
+	sharedEndpoint?: JevSharedEndpointInfo | null;
+}
+
+/* ------------------------------------------------------------------ */
+/* Shared-endpoint detection                                           */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Detect when the decision endpoint is the SAME server that generates the
+ * agent's own tokens ($PI_MODEL, resolved through models.json). The harness may
+ * sit on another box entirely — what matters is where the decode happens. Three
+ * consequences that are easy to get wrong otherwise:
+ *   - every answer is a decode pass contending with the agent's own generation,
+ *     so JEV buys CONTEXT WINDOW (its hidden reasoning never enters the agent's
+ *     context), not compute;
+ *   - `elapsedMs` then includes queue time behind the agent's in-flight requests
+ *     — latency measured this way is contended-state, not endpoint capability;
+ *   - switching decision models means loading different weights into the server
+ *     the running session is generating from, so `/jev-use` there is NOT a
+ *     jev-only operation.
+ */
+export interface JevSharedEndpointInfo {
+	agentModel: string;
+	agentBaseURL?: string;
+	/** same host:port as the decision endpoint → decisions decode where the agent runs */
+	shared: boolean;
+	/** the decision model id IS the agent's model id (same weights, possibly two routes) */
+	sameWeights: boolean;
+	basis: string;
+	note: string;
+}
+
+function originOf(url: string): string {
+	try {
+		const u = new URL(url);
+		return `${u.hostname.toLowerCase()}:${u.port || (u.protocol === "https:" ? "443" : "80")}`;
+	} catch {
+		return url.replace(/\/$/, "").toLowerCase();
+	}
+}
+
+export function detectSharedAgentEndpoint(cfg: {
+	baseURL?: string;
+	model?: string;
+}): JevSharedEndpointInfo | null {
+	const agentModel = String(process.env.PI_MODEL ?? "").trim();
+	if (!agentModel || !cfg?.model) return null;
+	const hits = listModelEndpoints().filter((e) => e.model === agentModel || e.model.includes(agentModel));
+	const agentBaseURL =
+		hits.find((h) => h.model === agentModel)?.baseURL ?? hits[0]?.baseURL;
+	const sameWeights = agentModel === cfg.model || agentModel.includes(cfg.model) || cfg.model.includes(agentModel);
+	const shared = !!agentBaseURL && !!cfg.baseURL && originOf(agentBaseURL) === originOf(cfg.baseURL);
+	if (!shared && !sameWeights) return null;
+	return {
+		agentModel,
+		...(agentBaseURL ? { agentBaseURL } : {}),
+		shared,
+		sameWeights,
+		basis: shared
+			? `agent $PI_MODEL=${agentModel} is declared at ${agentBaseURL} — the same origin as the decision endpoint ${cfg.baseURL}`
+			: `agent $PI_MODEL=${agentModel} is the decision model id (${cfg.model}) — same weights even if the routes differ`,
+		note:
+			"JEV buys CONTEXT WINDOW, not compute: each answer decodes on the accelerator that " +
+			"generates the agent's own tokens, so a big batch can stall the session behind it and " +
+			"elapsedMs here includes queue time (contended-state, not endpoint capability). It also " +
+			"means the decision model is the SAME PRIOR as the agent — structure and isolation, never " +
+			"independent information; verify with grep/make. And /jev-use on that box loads " +
+			"different weights into the server the running session is generating from.",
+	};
 }
 
 export function describeJevConfig(): JevConfigReport {
@@ -942,6 +1012,7 @@ export function describeJevConfig(): JevConfigReport {
 		})),
 		resolved,
 		error,
+		sharedEndpoint: resolved ? detectSharedAgentEndpoint(resolved) : null,
 	};
 }
 
@@ -1093,6 +1164,16 @@ async function callOpenAiCompatible(
 						? ` — it currently serves ${served.models.length ? served.models.join(", ") : "(nothing)"}`
 						: ` (live /models probe failed: ${served.error})`) +
 					`. Is the other decision server up? Switch the model with /jev-use <name> (current preference lives in ${adapterLocalPath()}).`;
+				// On a box where the agent's own tokens come from this same server,
+				// "start the other server" is advice that would take the weights out
+				// from under the session following it. Say so instead of letting it.
+				const shared = detectSharedAgentEndpoint(cfg);
+				if (shared?.shared) {
+					lastErr +=
+						` NOTE: ${cfg.baseURL} is ALSO the agent's own inference endpoint ($PI_MODEL=${shared.agentModel}),` +
+						` so loading a different decision model there restarts the server this session is generating from.` +
+						` Do it only when the session can be restarted, or point JEV_BASE_URL at a second server.`;
+				}
 				break;
 			}
 			lastErr = `HTTP ${res.status}: ${body}`;
